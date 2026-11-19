@@ -19,6 +19,7 @@
 mod batch;
 mod db;
 mod error;
+pub mod fs;
 pub mod key;
 mod memtable;
 mod options;

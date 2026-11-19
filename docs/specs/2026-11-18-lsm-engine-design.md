@@ -149,6 +149,13 @@ This is what makes crash testing possible without pulling the power cord.
 
 **Errors.** One `Error` enum (`Io`, `Corruption`, `InvalidArgument`, `Closed`). Corruption is always reported, never silently ignored, except for the expected torn WAL tail.
 
+**Milestone 2 additions** (decided while planning M2):
+- A `LOCK` file in the database directory, held with an OS file lock, so two `Db`s can't open the same directory. A second open returns `Error::AlreadyOpen`.
+- `Error::Poisoned`: after a failed WAL append or sync, further writes are refused until reopen. The log may end in a partial record, and a write acknowledged after it could be lost.
+- **Checkpoint at open:** after replaying the logs, the recovered memtable is written to a fresh log, synced, and the old logs are deleted. Old logs are never appended to. This is temporary: from M4, flushing to L0 replaces it.
+- WAL tail classification: damage with no valid record after it is a torn write and recovery stops there cleanly. Damage followed by valid records is corruption: an error with `paranoid_checks`, otherwise point-in-time recovery stops at the damage.
+- MSRV 1.89 (for `File::try_lock`). New dependencies: `crc32fast` (checksums), dev-only `tempfile`.
+
 ## 6. Testing strategy
 
 Correctness comes first, so these tests run from milestone 1:

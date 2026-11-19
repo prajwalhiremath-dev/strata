@@ -19,6 +19,17 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// Another `Db` (in this or another process) already has this directory
+    /// open. Two writers on one directory would corrupt each other's logs.
+    #[error("database already open: {0}")]
+    AlreadyOpen(String),
+
+    /// An earlier write failed to reach the log (append or sync error). The
+    /// log may now end in a partial record, so further writes are refused;
+    /// reopen the database to recover. Reads still work.
+    #[error("database is read-only after a failed write: {0}")]
+    Poisoned(String),
+
     /// The database was closed; no further operations are allowed.
     #[error("database is closed")]
     Closed,
