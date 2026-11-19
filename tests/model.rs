@@ -5,14 +5,18 @@
 //! read returns the same answer. When it finds a failing sequence it
 //! *shrinks* it to the smallest sequence that still fails.
 //!
-//! Later milestones add operations here (Flush, Reopen, Snapshot, Crash), so
+//! Milestone 2 added Reopen and Crash; later milestones add more (Flush,
+//! Snapshot, ...), so
 //! every new layer is tested against the same simple truth.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
 
 use proptest::prelude::*;
-use strata::{Db, Options, WriteBatch};
+use std::sync::Arc;
+
+use strata::fs::SimFs;
+use strata::{Db, Options, SyncPolicy, WriteBatch};
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -23,6 +27,11 @@ enum Op {
     Scan(Vec<u8>, Vec<u8>),
     /// `None` value = delete.
     Batch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
+    /// Close and reopen the database.
+    Reopen,
+    /// Power loss (drop everything unsynced), then reopen. With
+    /// `SyncPolicy::Always` every acknowledged write must survive.
+    Crash,
 }
 
 /// Tiny key alphabet (1–3 bytes from a..=e) so the same keys are hit often:
@@ -43,6 +52,8 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (key(), key()).prop_map(|(a, b)| Op::Scan(a, b)),
         1 => proptest::collection::vec((key(), proptest::option::of(value())), 0..6)
             .prop_map(Op::Batch),
+        1 => Just(Op::Reopen),
+        1 => Just(Op::Crash),
     ]
 }
 
@@ -51,11 +62,24 @@ proptest! {
 
     #[test]
     fn db_matches_btreemap(ops in proptest::collection::vec(op(), 1..200)) {
-        let db = Db::open_in_memory(Options::default()).unwrap();
+        let fs = SimFs::new();
+        let open = || {
+            let opts = Options { sync: SyncPolicy::Always, ..Options::default() };
+            Db::open_with_fs("/model", opts, Arc::new(fs.clone())).unwrap()
+        };
+        let mut db = open();
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
         for op in ops {
             match op {
+                Op::Reopen => {
+                    db.close().unwrap();
+                    db = open();
+                }
+                Op::Crash => {
+                    fs.crash();
+                    db = open();
+                }
                 Op::Put(k, v) => {
                     db.put(&k, &v).unwrap();
                     model.insert(k, v);
