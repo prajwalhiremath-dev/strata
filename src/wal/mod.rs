@@ -8,9 +8,7 @@ pub(crate) mod format;
 mod reader;
 mod writer;
 
-#[allow(unused_imports)] // used by Db from Task 4
 pub(crate) use reader::{WalEnd, read_records};
-#[allow(unused_imports)]
 pub(crate) use writer::WalWriter;
 
 #[cfg(test)]

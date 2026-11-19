@@ -66,7 +66,6 @@ impl WriteBatch {
     /// ```
     /// All integers little-endian. Lengths must already be validated
     /// (`Db::write` checks `MAX_KEY_LEN` / `MAX_VALUE_LEN`).
-    #[allow(dead_code)] // TEMP until Task 4
     pub(crate) fn encode(&self, first_seqno: SeqNo) -> Vec<u8> {
         let size: usize = 12
             + self
@@ -98,7 +97,6 @@ impl WriteBatch {
 
     /// Parse bytes produced by [`WriteBatch::encode`]. Returns `Corruption`
     /// (never panics) for anything malformed.
-    #[allow(dead_code)] // TEMP until Task 4
     pub(crate) fn decode(buf: &[u8]) -> Result<(SeqNo, WriteBatch)> {
         let mut r = Reader { buf };
         let first_seqno = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));

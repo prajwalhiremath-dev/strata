@@ -119,6 +119,16 @@ impl Memtable {
         out
     }
 
+    /// Every version of every key, in internal-key order (used to checkpoint
+    /// the recovered state into a fresh log).
+    pub(crate) fn entries(&self) -> Vec<(InternalKey, Vec<u8>)> {
+        self.map
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Approximate bytes held, used to decide when to freeze and flush.
     #[allow(dead_code)] // used to trigger flushes in milestone 4
     pub(crate) fn approximate_size(&self) -> usize {
