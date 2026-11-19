@@ -9,5 +9,7 @@
 
 mod error;
 pub mod key;
+#[allow(dead_code)] // wired into Db in the next commit
+mod memtable;
 
 pub use error::{Error, Result};
