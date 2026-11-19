@@ -8,5 +8,6 @@
 //! `docs/learn/` explaining what it does and why it is built that way.
 
 mod error;
+pub mod key;
 
 pub use error::{Error, Result};
