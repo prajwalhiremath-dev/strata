@@ -23,6 +23,8 @@ pub mod fs;
 pub mod key;
 mod memtable;
 mod options;
+#[allow(dead_code)] // wired into Db in Task 4 of milestone 2
+mod wal;
 
 pub use batch::WriteBatch;
 pub use db::{Db, MAX_KEY_LEN};
