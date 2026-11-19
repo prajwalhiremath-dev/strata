@@ -4,7 +4,7 @@ An embedded key-value storage engine in Rust, built from scratch on a **log-stru
 
 I'm building it in small milestones. Each milestone has its own code, tests and a learning chapter that explains what the layer does, why it's designed that way, and which alternatives were rejected.
 
-> **Status:** milestone 1 of 11. In-memory engine: internal keys, memtable, atomic batches, model-tested against `BTreeMap`. Disk (WAL) comes next. See the [milestone table](docs/specs/2026-11-18-lsm-engine-design.md#8-milestones-each-ends-at-a-stop-point).
+> **Status:** milestone 2 of 11. Durable writes through a checksummed write-ahead log, crash recovery tested against a simulated filesystem that pulls the plug (torn writes, failed syncs, crashes mid-recovery). Next: on-disk sorted tables (SSTables). See the [milestone table](docs/specs/2026-11-18-lsm-engine-design.md#8-milestones-each-ends-at-a-stop-point).
 
 ![strata architecture](docs/specs/strata-architecture.svg)
 
@@ -21,7 +21,7 @@ I'm building it in small milestones. Each milestone has its own code, tests and 
 ```rust
 use strata::{Db, Options, WriteBatch};
 
-let db = Db::open_in_memory(Options::default())?;
+let db = Db::open("my-data", Options::default())?; // recovers after a crash
 db.put(b"user:1", b"alice")?;
 
 let mut batch = WriteBatch::new();
@@ -36,6 +36,7 @@ assert_eq!(db.get(b"user:1")?, Some(b"alice".to_vec()));
 ```bash
 cargo test
 cargo run --release --example write_patterns   # chapter 00 experiment
+cargo run --release --example crash_demo -- write /tmp/strata-demo always   # chapter 02: kill -9 it, then `verify`
 ```
 
 ## License
