@@ -297,6 +297,15 @@ fn replay(
         for record in records {
             // The CRC matched, so undecodable contents are real corruption.
             let (first, batch) = WriteBatch::decode(&record)?;
+            let in_range = first >= 1
+                && first
+                    .checked_add(batch.len() as u64)
+                    .is_some_and(|end| end - 1 <= MAX_SEQNO);
+            if !in_range {
+                return Err(Error::Corruption(format!(
+                    "{name}: batch with out-of-range sequence number {first}"
+                )));
+            }
             for (i, op) in batch.ops.iter().enumerate() {
                 let seqno = first + i as u64;
                 apply(memtable, seqno, op);
@@ -351,4 +360,31 @@ fn checkpoint(
         fs.sync_dir(dir)?; // the removals are durable
     }
     Ok(wal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record whose checksum is valid but whose sequence numbers are out of
+    /// range must be reported as corruption, not overflow / panic.
+    #[test]
+    fn replay_rejects_out_of_range_seqno() {
+        let fs = SimFs::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let mut wal = WalWriter::new(fs.create(&dir.join(log_name(1))).unwrap());
+        let mut batch = WriteBatch::new();
+        batch.put(b"a", b"1").put(b"b", b"2");
+        wal.add_record(&batch.encode(u64::MAX - 1)).unwrap();
+        wal.sync().unwrap();
+        fs.sync_dir(dir).unwrap();
+
+        let result = Db::open_with_fs(dir, Options::default(), Arc::new(fs.clone()));
+        assert!(
+            matches!(result, Err(Error::Corruption(_))),
+            "{:?}",
+            result.err()
+        );
+    }
 }
