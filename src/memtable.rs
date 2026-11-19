@@ -120,6 +120,7 @@ impl Memtable {
     }
 
     /// Approximate bytes held, used to decide when to freeze and flush.
+    #[allow(dead_code)] // used to trigger flushes in milestone 4
     pub(crate) fn approximate_size(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }

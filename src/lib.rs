@@ -6,10 +6,24 @@
 //! background process merges those files level by level. It is written from
 //! scratch as a learning project: every layer has a matching chapter in
 //! `docs/learn/` explaining what it does and why it is built that way.
+//!
+//! ```
+//! use strata::{Db, Options};
+//!
+//! let db = Db::open_in_memory(Options::default())?;
+//! db.put(b"hello", b"world")?;
+//! assert_eq!(db.get(b"hello")?, Some(b"world".to_vec()));
+//! # Ok::<(), strata::Error>(())
+//! ```
 
+mod batch;
+mod db;
 mod error;
 pub mod key;
-#[allow(dead_code)] // wired into Db in the next commit
 mod memtable;
+mod options;
 
+pub use batch::WriteBatch;
+pub use db::{Db, MAX_KEY_LEN};
 pub use error::{Error, Result};
+pub use options::Options;
