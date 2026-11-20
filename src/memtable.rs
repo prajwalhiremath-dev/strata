@@ -123,14 +123,18 @@ impl Memtable {
         out
     }
 
-    /// Every version of every key, in internal-key order (used to checkpoint
-    /// the recovered state into a fresh log).
+    /// Every version of every key, in internal-key order (what a flush
+    /// writes to a table).
     pub(crate) fn entries(&self) -> Vec<(InternalKey, Vec<u8>)> {
         self.map
             .read()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.read().is_empty()
     }
 
     /// Approximate bytes held, used to decide when to freeze and flush.

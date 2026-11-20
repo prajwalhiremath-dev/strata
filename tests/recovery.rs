@@ -1,4 +1,5 @@
-//! Durability and crash-recovery tests (milestone 2).
+//! Durability and crash-recovery tests (milestone 2; open flushes to a
+//! table from milestone 4).
 //!
 //! Most tests run on `SimFs`, which can "pull the plug" and keep only what
 //! was synced (or, with `crash_torn`, a torn version of the unsynced tail).
@@ -211,68 +212,8 @@ fn mid_log_corruption() {
     }
 }
 
-#[test]
-fn crash_at_every_step_of_open() {
-    let fs = SimFs::new();
-    let db = open(&fs, opts(SyncPolicy::Always)).unwrap();
-    write_pairs(&db, 0..100);
-    db.delete(&key("a", 3)).unwrap();
-    let expected = all(&db);
-    db.close().unwrap();
-    drop(db);
-
-    for n in 0.. {
-        assert!(n < 10_000, "open never finished");
-        fs.kill_after(n);
-        match open(&fs, opts(SyncPolicy::Always)) {
-            Ok(db) => {
-                // Open needed exactly `n` mutating steps. Don't `close`: its
-                // sync would be step n+1 and hit the simulated death.
-                assert_eq!(all(&db), expected, "uninterrupted open");
-                // Power fails right after a successful open, before any write:
-                // the checkpoint must already be durable.
-                fs.crash();
-                drop(db);
-                let db = open(&fs, opts(SyncPolicy::Always)).unwrap();
-                assert_eq!(all(&db), expected, "crash right after open");
-                break;
-            }
-            Err(_) => {
-                fs.crash();
-                let db = open(&fs, opts(SyncPolicy::Always)).unwrap();
-                assert_eq!(all(&db), expected, "after dying at step {n} of open");
-                db.close().unwrap();
-            }
-        }
-    }
-}
-
-#[test]
-fn old_and_new_logs_together_replay_same_state() {
-    let fs = SimFs::new();
-    let db = open(&fs, opts(SyncPolicy::Always)).unwrap();
-    write_pairs(&db, 0..50);
-    write_pairs(&db, 0..25); // overwrite with identical values but newer seqnos
-    db.delete(&key("b", 7)).unwrap();
-    db.close().unwrap();
-    drop(db);
-
-    let old = log_files(&fs).pop().unwrap();
-    fs.create_dir_all(Path::new("/saved")).unwrap();
-    fs.copy_file(&Path::new(DIR).join(&old), Path::new("/saved/old.log"));
-
-    let db = open(&fs, opts(SyncPolicy::Always)).unwrap(); // checkpoint: old log replaced
-    let expected = all(&db);
-    db.close().unwrap();
-    drop(db);
-    assert!(!log_files(&fs).contains(&old));
-
-    // Simulate a crash after the new log was written but before the old one
-    // was deleted: both exist. Replaying both must give the same state.
-    fs.copy_file(Path::new("/saved/old.log"), &Path::new(DIR).join(&old));
-    let db = open(&fs, opts(SyncPolicy::Always)).unwrap();
-    assert_eq!(all(&db), expected);
-}
+// `crash_at_every_step_of_open` and the old-log/new-state test moved to
+// tests/flush.rs in milestone 4: open now flushes to a table.
 
 fn poison_case(fail: impl Fn(&SimFs)) {
     let fs = SimFs::new();

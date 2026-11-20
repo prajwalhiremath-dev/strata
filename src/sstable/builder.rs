@@ -81,18 +81,25 @@ pub struct TableBuilder {
     failed: bool,
 }
 
-impl TableBuilder {
-    pub fn new(file: Box<dyn WritableFile>, opts: TableOptions) -> Result<Self> {
-        if opts.block_size == 0 || opts.restart_interval == 0 {
+impl TableOptions {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.block_size == 0 || self.restart_interval == 0 {
             return Err(Error::InvalidArgument(
                 "block_size and restart_interval must be at least 1".into(),
             ));
         }
-        if opts.block_size > MAX_BLOCK_SIZE {
+        if self.block_size > MAX_BLOCK_SIZE {
             return Err(Error::InvalidArgument(format!(
                 "block_size must be at most {MAX_BLOCK_SIZE}"
             )));
         }
+        Ok(())
+    }
+}
+
+impl TableBuilder {
+    pub fn new(file: Box<dyn WritableFile>, opts: TableOptions) -> Result<Self> {
+        opts.validate()?;
         Ok(TableBuilder {
             data: BlockBuilder::new(opts.restart_interval),
             index: BlockBuilder::new(1),

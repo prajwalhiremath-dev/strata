@@ -1,5 +1,17 @@
 //! The public `Db` handle.
 //!
+//! **Where data lives.** Newest first:
+//!
+//! - `mem`: the memtable new writes go into;
+//! - `imm`: a full memtable being written to disk (only during a flush);
+//! - `tables`: L0 tables on disk, newest first. Tables may overlap in key
+//!   range, so a read checks each in turn (compaction, milestone 7, fixes
+//!   that).
+//!
+//! These three form one [`ReadState`], swapped as a whole behind an
+//! `RwLock<Arc<_>>`. A reader clones the `Arc` and searches without holding
+//! any lock; a flush builds a new `ReadState` and swaps it in.
+//!
 //! **Write path** (under the writer mutex), in this exact order:
 //!
 //! 1. validate the whole batch (nothing is applied if any key/value is bad)
@@ -14,38 +26,36 @@
 //! a partial record, and a later write appended after it would be lost on
 //! recovery, so further writes are refused (chapter 02).
 //!
-//! **Open path**: lock the directory, replay every log in file-number order,
-//! then *checkpoint*: write the recovered state into a brand-new log, sync it
-//! and the directory, and delete the old logs. We never append to a log that
-//! existed before `open`. (From milestone 4 a flush to disk replaces this.)
+//! **Open path**: see [`recovery`]. Old logs are replayed, written to a table
+//! and deleted; the database then starts a fresh log.
 
+mod files;
+mod flush;
+mod recovery;
+
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::batch::{BatchOp, MAX_VALUE_LEN, WriteBatch};
 use crate::fs::{FileLock, FileSystem, OsFs, SimFs};
 use crate::key::{MAX_SEQNO, SeqNo, ValueKind};
 use crate::memtable::{Lookup, Memtable};
 use crate::options::{Options, SyncPolicy};
-use crate::wal::{WalEnd, WalWriter, read_records};
+use crate::sstable::Table;
+use crate::wal::WalWriter;
 use crate::{Error, Result};
 
-/// Longest accepted key. SSTables (milestone 3) store key lengths as `u16`.
+/// Longest accepted key. Tables could store keys up to `u32::MAX` bytes, but
+/// every index entry holds a whole key, so huge keys make huge indexes; 64 KiB
+/// is far beyond any sensible key.
 pub const MAX_KEY_LEN: usize = 65_535;
 
 const LOCK_FILE: &str = "LOCK";
-
-fn log_name(number: u64) -> String {
-    format!("{number:06}.log")
-}
-
-fn parse_log_name(name: &str) -> Option<u64> {
-    name.strip_suffix(".log")?.parse().ok()
-}
 
 /// A handle to an open database. Cheap to clone; clones share the same data
 /// and can be sent to other threads.
@@ -54,9 +64,22 @@ pub struct Db {
     inner: Arc<DbInner>,
 }
 
+/// Every place a read must look, newest first. Immutable once published.
+pub(crate) struct ReadState {
+    pub(crate) mem: Arc<Memtable>,
+    pub(crate) imm: Option<Arc<Memtable>>,
+    /// Newest first.
+    pub(crate) tables: Vec<Arc<Table>>,
+}
+
 struct DbInner {
     options: Options,
-    memtable: Memtable,
+    #[allow(dead_code)] // the write-path flush uses these from Task 5
+    fs: Arc<dyn FileSystem>,
+    #[allow(dead_code)]
+    dir: PathBuf,
+    /// Replaced (never mutated) under the writer lock.
+    state: RwLock<Arc<ReadState>>,
     /// Serialises writers and owns the log.
     writer: Mutex<Writer>,
     /// Last sequence number whose batch is fully applied. Readers use it as
@@ -69,6 +92,12 @@ struct Writer {
     /// Last *assigned* sequence number.
     last_seqno: SeqNo,
     wal: WalWriter,
+    /// The current log's file number (deleted after the next flush).
+    #[allow(dead_code)] // the write-path flush uses these from Task 5
+    log_number: u64,
+    /// Next unused file number, shared by logs and tables.
+    #[allow(dead_code)]
+    next_file_number: u64,
     writes_since_sync: u32,
     /// Set after a failed log append/sync; further writes are refused.
     poisoned: Option<String>,
@@ -98,34 +127,30 @@ impl Db {
         if options.sync == SyncPolicy::EveryN(0) {
             return Err(Error::InvalidArgument("SyncPolicy::EveryN(0)".into()));
         }
+        // Checked now, not at the first flush: a bad option there would
+        // poison a database that had been accepting writes.
+        options.table.validate()?;
         let dir = path.as_ref().to_path_buf();
         fs.create_dir_all(&dir)?;
         let lock = fs.lock(&dir.join(LOCK_FILE))?;
-
-        let mut logs: Vec<(u64, String)> = fs
-            .list(&dir)?
-            .into_iter()
-            .filter_map(|name| parse_log_name(&name).map(|n| (n, name)))
-            .collect();
-        logs.sort();
-
-        let memtable = Memtable::new();
-        let max_seqno = replay(fs.as_ref(), &dir, &logs, &memtable, &options)?;
-        let next_number = logs.last().map_or(1, |(n, _)| n + 1);
-        let wal = checkpoint(fs.as_ref(), &dir, &logs, &memtable, next_number)?;
+        let r = recovery::recover(fs.as_ref(), &dir, &options)?;
 
         Ok(Db {
             inner: Arc::new(DbInner {
                 options,
-                memtable,
+                fs,
+                dir,
+                state: RwLock::new(Arc::new(r.state)),
                 writer: Mutex::new(Writer {
-                    last_seqno: max_seqno,
-                    wal,
+                    last_seqno: r.last_seqno,
+                    wal: r.wal,
+                    log_number: r.log_number,
+                    next_file_number: r.next_file_number,
                     writes_since_sync: 0,
                     poisoned: None,
                     lock: Some(lock),
                 }),
-                visible_seqno: AtomicU64::new(max_seqno),
+                visible_seqno: AtomicU64::new(r.last_seqno),
                 closed: AtomicBool::new(false),
             }),
         })
@@ -187,8 +212,10 @@ impl Db {
             return Err(e);
         }
 
+        // The memtable only changes under the writer lock, which we hold.
+        let mem = self.inner.state.read().mem.clone();
         for (i, op) in batch.ops.iter().enumerate() {
-            apply(&self.inner.memtable, first + i as u64, op);
+            apply(&mem, first + i as u64, op);
         }
         w.last_seqno += count;
         // Publish: everything inserted above "happens before" any reader that
@@ -201,25 +228,67 @@ impl Db {
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
-        let snapshot = self.inner.visible_seqno.load(Ordering::Acquire);
-        Ok(match self.inner.memtable.get(key, snapshot) {
-            Lookup::Found(v) => Some(v),
-            // Later milestones keep searching disk on NotFound, but stop on Deleted.
-            Lookup::Deleted | Lookup::NotFound => None,
-        })
+        let (snapshot, state) = self.read_view();
+        for mem in std::iter::once(&state.mem).chain(&state.imm) {
+            match mem.get(key, snapshot) {
+                Lookup::Found(v) => return Ok(Some(v)),
+                Lookup::Deleted => return Ok(None), // hides every older source
+                Lookup::NotFound => {}
+            }
+        }
+        for table in &state.tables {
+            match table.get(key, snapshot)? {
+                Lookup::Found(v) => return Ok(Some(v)),
+                Lookup::Deleted => return Ok(None),
+                Lookup::NotFound => {}
+            }
+        }
+        Ok(None)
     }
 
     /// All live key/value pairs with keys inside the bounds, in key order.
+    ///
+    /// Collects every source's matches into memory, then merges; streaming
+    /// iterators replace this in milestone 6.
     pub fn scan(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
-        let snapshot = self.inner.visible_seqno.load(Ordering::Acquire);
-        Ok(self
-            .inner
-            .memtable
-            .scan(start, end, snapshot)
+        let (snapshot, state) = self.read_view();
+        // Sources hold disjoint seqno ranges, newer sources higher ones, so
+        // the first source (newest first) that has a key has its newest
+        // visible version. Tombstones take part in the merge, so an older
+        // value under a newer tombstone stays hidden; drop them only after.
+        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        let mut take = |rows: Vec<crate::memtable::ScanRow>| {
+            for (k, v) in rows {
+                merged.entry(k).or_insert(v);
+            }
+        };
+        take(state.mem.scan(start, end, snapshot));
+        if let Some(imm) = &state.imm {
+            take(imm.scan(start, end, snapshot));
+        }
+        for table in &state.tables {
+            take(table.scan(start, end, snapshot)?);
+        }
+        Ok(merged
             .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v))) // hide tombstones
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
             .collect())
+    }
+
+    /// A snapshot seqno and the sources to search.
+    ///
+    /// The seqno is loaded **first**. If the state were taken first, a flush
+    /// could swap in a new memtable, a writer could put seqno `s` into it and
+    /// publish `s`, and we would then read with snapshot `s` from the old
+    /// state, which doesn't contain it. The other way round is safe: entries
+    /// only move from newer to older sources, and every state keeps `imm`
+    /// until its table is in `tables`, so anything at or below the snapshot
+    /// is in the state we take.
+    fn read_view(&self) -> (SeqNo, Arc<ReadState>) {
+        let snapshot = self.inner.visible_seqno.load(Ordering::Acquire);
+        let state = self.inner.state.read().clone();
+        (snapshot, state)
     }
 
     /// Sync the log, release the directory lock and close. Further operations
@@ -270,100 +339,16 @@ fn validate(op: &BatchOp) -> Result<()> {
     Ok(())
 }
 
-fn apply(memtable: &Memtable, seqno: SeqNo, op: &BatchOp) {
+pub(crate) fn apply(memtable: &Memtable, seqno: SeqNo, op: &BatchOp) {
     match op {
         BatchOp::Put { key, value } => memtable.insert(seqno, ValueKind::Put, key, value),
         BatchOp::Delete { key } => memtable.insert(seqno, ValueKind::Delete, key, &[]),
     }
 }
 
-/// Replay `logs` (sorted by number) into `memtable`; returns the highest
-/// sequence number seen.
-///
-/// Entries keep their *original* seqnos, so replaying the same record twice
-/// (an old log and its checkpoint copy) inserts identical internal keys:
-/// replay is idempotent.
-fn replay(
-    fs: &dyn FileSystem,
-    dir: &Path,
-    logs: &[(u64, String)],
-    memtable: &Memtable,
-    options: &Options,
-) -> Result<SeqNo> {
-    let mut max_seqno = 0;
-    for (_, name) in logs {
-        let buf = fs.read(&dir.join(name))?;
-        let (records, end) = read_records(&buf);
-        for record in records {
-            // The CRC matched, so undecodable contents are real corruption.
-            let (first, batch) = WriteBatch::decode(&record)?;
-            let in_range = first >= 1
-                && first
-                    .checked_add(batch.len() as u64)
-                    .is_some_and(|end| end - 1 <= MAX_SEQNO);
-            if !in_range {
-                return Err(Error::Corruption(format!(
-                    "{name}: batch with out-of-range sequence number {first}"
-                )));
-            }
-            for (i, op) in batch.ops.iter().enumerate() {
-                let seqno = first + i as u64;
-                apply(memtable, seqno, op);
-                max_seqno = max_seqno.max(seqno);
-            }
-        }
-        match end {
-            // A torn tail is what a crash mid-write looks like: fine.
-            WalEnd::Clean | WalEnd::TornTail { .. } => {}
-            WalEnd::Corrupt { offset } if options.paranoid_checks => {
-                return Err(Error::Corruption(format!(
-                    "{name}: damaged record at offset {offset} followed by valid records"
-                )));
-            }
-            // Point-in-time recovery: keep what came before the damage and
-            // ignore everything after it, in this log and later ones.
-            WalEnd::Corrupt { .. } => break,
-        }
-    }
-    Ok(max_seqno)
-}
-
-/// Write the recovered state into a new log, make it durable, then delete
-/// the old logs. Safe to crash at any step:
-///
-/// - before the new log is durable: old logs are intact, replay them again;
-/// - after, but before all old logs are gone: old + new logs replay to the
-///   same state (identical seqnos).
-fn checkpoint(
-    fs: &dyn FileSystem,
-    dir: &Path,
-    old_logs: &[(u64, String)],
-    memtable: &Memtable,
-    number: u64,
-) -> Result<WalWriter> {
-    let path: PathBuf = dir.join(log_name(number));
-    let mut wal = WalWriter::new(fs.create(&path)?);
-    for (ikey, value) in memtable.entries() {
-        let mut b = WriteBatch::new();
-        match ikey.kind {
-            ValueKind::Put => b.put(&ikey.user_key, &value),
-            ValueKind::Delete => b.delete(&ikey.user_key),
-        };
-        wal.add_record(&b.encode(ikey.seqno))?;
-    }
-    wal.sync()?;
-    fs.sync_dir(dir)?; // the new log's directory entry is durable
-    for (_, name) in old_logs {
-        fs.remove(&dir.join(name))?;
-    }
-    if !old_logs.is_empty() {
-        fs.sync_dir(dir)?; // the removals are durable
-    }
-    Ok(wal)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::files::log_name;
     use super::*;
 
     /// A record whose checksum is valid but whose sequence numbers are out of

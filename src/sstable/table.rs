@@ -87,7 +87,6 @@ impl Table {
     }
 
     /// The newest version of `user_key` with seqno <= `snapshot`.
-    #[allow(dead_code)] // the Db read path calls it from Task 4 of milestone 4
     pub(crate) fn get(&self, user_key: &[u8], snapshot: SeqNo) -> Result<Lookup> {
         // A clear bit in the filter proves the key was never added: no need
         // to touch a data block.
@@ -120,7 +119,6 @@ impl Table {
     /// Like `Memtable::scan`: the newest version visible at `snapshot` of
     /// every user key in the range, ascending. `None` marks a tombstone, which
     /// the caller needs to hide older values in other sources.
-    #[allow(dead_code)] // the Db read path calls it from Task 4 of milestone 4
     pub(crate) fn scan(
         &self,
         start: Bound<&[u8]>,

@@ -1,5 +1,7 @@
 //! Tuning knobs passed to [`crate::Db::open`].
 
+use crate::sstable::TableOptions;
+
 /// When the write-ahead log is synced (made durable) during writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
@@ -19,8 +21,8 @@ pub enum SyncPolicy {
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Approximate memtable size (bytes) at which it is frozen and flushed to
-    /// disk. Bigger means fewer, larger files but more memory and a longer
-    /// WAL replay after a crash. Used from milestone 4 (flush).
+    /// disk as an L0 table. Bigger means fewer, larger files but more memory
+    /// and a longer WAL replay after a crash. Default: 4 MiB.
     pub memtable_size: usize,
 
     /// Durability vs speed trade-off for writes. Default: `Always`.
@@ -32,6 +34,10 @@ pub struct Options {
     /// ("point-in-time recovery"). A torn tail from a crash is never an
     /// error either way. Default: false.
     pub paranoid_checks: bool,
+
+    /// How tables are laid out: block size, restart interval, bloom filter
+    /// bits per key (chapters 03 and 04).
+    pub table: TableOptions,
 }
 
 impl Default for Options {
@@ -40,6 +46,7 @@ impl Default for Options {
             memtable_size: 4 * 1024 * 1024,
             sync: SyncPolicy::Always,
             paranoid_checks: false,
+            table: TableOptions::default(),
         }
     }
 }

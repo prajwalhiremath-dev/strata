@@ -31,3 +31,4 @@ pub use batch::{MAX_VALUE_LEN, WriteBatch};
 pub use db::{Db, MAX_KEY_LEN};
 pub use error::{Error, Result};
 pub use options::{Options, SyncPolicy};
+pub use sstable::TableOptions;
