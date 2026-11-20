@@ -14,6 +14,8 @@
 //! Chapter 03 walks through every byte.
 
 pub(crate) mod block;
+#[allow(dead_code)] // used by the builder and reader from Task 3 on
+pub(crate) mod bloom;
 mod builder;
 pub(crate) mod format;
 mod table;
