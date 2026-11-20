@@ -4,7 +4,7 @@ An embedded key-value storage engine in Rust, built from scratch on a **log-stru
 
 I'm building it in small milestones. Each milestone has its own code, tests and a learning chapter that explains what the layer does, why it's designed that way, and which alternatives were rejected.
 
-> **Status:** milestone 2 of 11. Durable writes through a checksummed write-ahead log, crash recovery tested against a simulated filesystem that pulls the plug (torn writes, failed syncs, crashes mid-recovery). Next: on-disk sorted tables (SSTables). See the [milestone table](docs/specs/2026-11-18-lsm-engine-design.md#8-milestones-each-ends-at-a-stop-point).
+> **Status:** milestone 3 of 11. Durable writes through a checksummed write-ahead log with tested crash recovery, and an on-disk sorted table format (SSTable) with prefix-compressed blocks, an index and per-block checksums. Every damaged byte is detected. Next: bloom filters and flushing the memtable to disk. See the [milestone table](docs/specs/2026-11-18-lsm-engine-design.md#8-milestones-each-ends-at-a-stop-point).
 
 ![strata architecture](docs/specs/strata-architecture.svg)
 
@@ -37,6 +37,7 @@ assert_eq!(db.get(b"user:1")?, Some(b"alice".to_vec()));
 cargo test
 cargo run --release --example write_patterns   # chapter 00 experiment
 cargo run --release --example crash_demo -- write /tmp/strata-demo always   # chapter 02: kill -9 it, then `verify`
+cargo run --release --example sst_layout                                     # chapter 03: restart interval vs file size
 ```
 
 ## License
