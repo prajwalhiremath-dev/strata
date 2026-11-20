@@ -14,6 +14,12 @@ use crate::{Error, Result};
 /// entry is added.
 pub const MAX_BLOCK_SIZE: usize = 1 << 30;
 
+/// Largest allowed `bloom_bits_per_key`. Past about 43 bits per key the
+/// number of probes is already at its cap of 30, so more bits only waste
+/// space; this limit stops a typo from allocating gigabytes at the first
+/// flush.
+pub const MAX_BLOOM_BITS_PER_KEY: usize = 64;
+
 /// Largest key or value in one entry: lengths are stored as u32 varints.
 /// (Restart offsets stay small regardless: a restart is recorded before its
 /// entry is added, when the block is still under `block_size`.) This equals
@@ -91,6 +97,11 @@ impl TableOptions {
         if self.block_size > MAX_BLOCK_SIZE {
             return Err(Error::InvalidArgument(format!(
                 "block_size must be at most {MAX_BLOCK_SIZE}"
+            )));
+        }
+        if self.bloom_bits_per_key > MAX_BLOOM_BITS_PER_KEY {
+            return Err(Error::InvalidArgument(format!(
+                "bloom_bits_per_key must be at most {MAX_BLOOM_BITS_PER_KEY}"
             )));
         }
         Ok(())
@@ -294,6 +305,10 @@ mod tests {
             },
             TableOptions {
                 block_size: MAX_BLOCK_SIZE + 1,
+                ..Default::default()
+            },
+            TableOptions {
+                bloom_bits_per_key: MAX_BLOOM_BITS_PER_KEY + 1,
                 ..Default::default()
             },
         ] {

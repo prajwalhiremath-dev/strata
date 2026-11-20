@@ -496,3 +496,17 @@ fn reader_during_flushes() {
     assert!(files(&fs, ".sst").len() > 5, "many flushes happened");
     assert!(rounds > 0);
 }
+
+#[test]
+fn huge_file_number_is_corruption_not_overflow() {
+    let fs = SimFs::new();
+    fs.create_dir_all(Path::new(DIR)).unwrap();
+    for n in [u64::MAX, u64::MAX - 1, (1 << 48) + 1] {
+        let name = Path::new(DIR).join(format!("{n}.log"));
+        let mut f = fs.create(&name).unwrap();
+        f.sync().unwrap();
+        fs.sync_dir(Path::new(DIR)).unwrap();
+        assert!(matches!(open(&fs), Err(Error::Corruption(_))), "{n}");
+        fs.remove(&name).unwrap();
+    }
+}

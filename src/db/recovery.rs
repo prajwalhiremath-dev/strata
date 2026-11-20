@@ -28,6 +28,8 @@ use crate::sstable::Table;
 use crate::wal::{WalEnd, WalWriter, read_records};
 use crate::{Error, Result};
 
+const MAX_FILE_NUMBER: u64 = 1 << 48;
+
 /// Everything `open` needs to build the `Db`.
 pub(crate) struct Recovered {
     pub(crate) state: ReadState,
@@ -45,6 +47,12 @@ pub(crate) fn recover(fs: &dyn FileSystem, dir: &Path, options: &Options) -> Res
         let Some((number, kind)) = parse_file_name(&name) else {
             continue;
         };
+        // A flush a microsecond for a century uses about 2^42 numbers, so
+        // anything this large was not written by strata, and the cap leaves
+        // room for `+ 1` everywhere without overflow checks.
+        if number > MAX_FILE_NUMBER {
+            return Err(Error::Corruption(format!("{name}: file number too large")));
+        }
         next_file_number = next_file_number.max(number + 1);
         match kind {
             FileKind::Log => logs.push((number, name)),

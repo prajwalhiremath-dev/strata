@@ -30,9 +30,10 @@ enum Op {
     Batch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
     /// Close and reopen the database.
     Reopen,
-    /// Power loss (drop everything unsynced), then reopen. With
+    /// Power loss (drop everything unsynced, and keep an arbitrary subset of
+    /// unsynced directory changes, seeded), then reopen. With
     /// `SyncPolicy::Always` every acknowledged write must survive.
-    Crash,
+    Crash(u64),
     /// Write the memtable to an L0 table now.
     Flush,
 }
@@ -56,7 +57,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => proptest::collection::vec((key(), proptest::option::of(value())), 0..6)
             .prop_map(Op::Batch),
         1 => Just(Op::Reopen),
-        1 => Just(Op::Crash),
+        1 => any::<u64>().prop_map(Op::Crash),
         1 => Just(Op::Flush),
     ]
 }
@@ -81,8 +82,8 @@ proptest! {
                     db.close().unwrap();
                     db = open();
                 }
-                Op::Crash => {
-                    fs.crash();
+                Op::Crash(seed) => {
+                    fs.crash_reordered(seed);
                     db = open();
                 }
                 Op::Flush => db.flush().unwrap(),

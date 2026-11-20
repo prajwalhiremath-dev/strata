@@ -472,6 +472,13 @@ impl FileSystem for SimFs {
         let mut st = self.state.lock();
         st.mutate()?;
         let names = st.live.get(dir).cloned().ok_or_else(|| not_found(dir))?;
+        // Removed (or renamed-away) files in `dir` can no longer come back,
+        // so drop their contents. Without this an in-memory `Db` would keep
+        // every log and table it ever deleted.
+        st.files.retain(|path, _| {
+            let (d, name) = split(path);
+            d != dir || names.contains(&name)
+        });
         st.durable.insert(dir.to_path_buf(), names);
         Ok(())
     }
@@ -771,6 +778,25 @@ mod tests {
         }
         // Removal kept or not, creation kept or not: all four combinations.
         assert_eq!(outcomes.len(), 4, "{outcomes:?}");
+    }
+
+    #[test]
+    fn sync_dir_drops_dead_contents() {
+        let (fs, p) = setup();
+        synced_file(&fs, &p, b"abc");
+        let q = dir().join("b.sst");
+        fs.rename(&p, &q).unwrap();
+        fs.remove(&q).unwrap();
+        assert_eq!(
+            fs.state.lock().files.len(),
+            2,
+            "kept until the dir is synced"
+        );
+        fs.sync_dir(dir()).unwrap();
+        assert!(
+            fs.state.lock().files.is_empty(),
+            "nothing can bring them back now"
+        );
     }
 
     #[test]
