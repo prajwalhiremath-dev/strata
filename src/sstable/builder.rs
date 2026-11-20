@@ -8,6 +8,17 @@ use crate::fs::WritableFile;
 use crate::key::{InternalKey, compare_encoded};
 use crate::{Error, Result};
 
+/// Largest allowed `block_size`. Offsets inside a block are `u32`, so a
+/// block must stay well under 4 GiB even after its last (possibly large)
+/// entry is added.
+pub const MAX_BLOCK_SIZE: usize = 1 << 30;
+
+/// Largest key or value in one entry: lengths are stored as u32 varints.
+/// (Restart offsets stay small regardless: a restart is recorded before its
+/// entry is added, when the block is still under `block_size`.) This equals
+/// `MAX_VALUE_LEN`, so anything `Db` accepts can be flushed.
+const MAX_ENTRY_PART: usize = u32::MAX as usize;
+
 /// How a table is laid out.
 #[derive(Clone, Debug)]
 pub struct TableOptions {
@@ -66,6 +77,11 @@ impl TableBuilder {
                 "block_size and restart_interval must be at least 1".into(),
             ));
         }
+        if opts.block_size > MAX_BLOCK_SIZE {
+            return Err(Error::InvalidArgument(format!(
+                "block_size must be at most {MAX_BLOCK_SIZE}"
+            )));
+        }
         Ok(TableBuilder {
             data: BlockBuilder::new(opts.restart_interval),
             index: BlockBuilder::new(1),
@@ -85,6 +101,12 @@ impl TableBuilder {
         self.check_usable()?;
         InternalKey::decode(key)
             .map_err(|_| Error::InvalidArgument("not an encoded internal key".into()))?;
+        // Block entries store lengths as u32.
+        if key.len() > MAX_ENTRY_PART || value.len() > MAX_ENTRY_PART {
+            return Err(Error::InvalidArgument(
+                "key or value too large for a table entry".into(),
+            ));
+        }
         if self.num_entries > 0 && compare_encoded(&self.last_key, key) != Ordering::Less {
             return Err(Error::InvalidArgument(
                 "keys must be added in strictly increasing internal-key order".into(),
@@ -224,6 +246,10 @@ mod tests {
             },
             TableOptions {
                 restart_interval: 0,
+                ..Default::default()
+            },
+            TableOptions {
+                block_size: MAX_BLOCK_SIZE + 1,
                 ..Default::default()
             },
         ] {

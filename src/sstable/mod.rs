@@ -20,5 +20,5 @@ mod table;
 #[cfg(test)]
 mod tests;
 
-pub use builder::{TableBuilder, TableMeta, TableOptions};
+pub use builder::{MAX_BLOCK_SIZE, TableBuilder, TableMeta, TableOptions};
 pub use table::{Table, TableIter};
