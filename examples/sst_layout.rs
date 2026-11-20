@@ -54,6 +54,7 @@ fn main() -> strata::Result<()> {
             TableOptions {
                 block_size: 4096,
                 restart_interval: interval,
+                ..Default::default()
             },
         )?;
         for i in 0..N {

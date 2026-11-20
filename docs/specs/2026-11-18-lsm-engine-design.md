@@ -160,7 +160,7 @@ This is what makes crash testing possible without pulling the power cord.
 - `FileSystem::open_random` returns a `RandomAccessFile` with `read_at(offset, len)` and `size()`. SSTables are read a block at a time, not whole. On unix it uses `pread`.
 - Block entries use varints (LEB128) for lengths: `shared | non_shared | value_len | key delta | value`.
 - The block trailer is only a 4-byte CRC32. There's no compression byte: compression is out of scope for now.
-- The footer is a fixed 48 bytes: index handle, filter handle, format version 1, a CRC over the first 36 bytes, and the magic `strataT1`. The filter handle is reserved (must be zero) until M4 adds bloom filters.
+- The footer is a fixed 48 bytes: index handle, filter handle, format version 1, a CRC over the first 36 bytes, and the magic `strataT1`. The filter handle is reserved (must be zero) until M4 adds bloom filters. *(Superseded in M4: the footer is now version 2, 56 bytes, with `max_seqno`; see below.)*
 - The index stores each block's full last key. LevelDB's shorter separator keys are explained but not implemented.
 - No block cache yet. Every block read goes to the file.
 

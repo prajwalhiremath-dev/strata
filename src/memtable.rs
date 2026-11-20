@@ -31,6 +31,10 @@ pub(crate) enum Lookup {
     NotFound,
 }
 
+/// One row of a scan: a user key and its newest visible value, or `None`
+/// for a tombstone.
+pub(crate) type ScanRow = (Vec<u8>, Option<Vec<u8>>);
+
 pub(crate) struct Memtable {
     map: RwLock<BTreeMap<InternalKey, Vec<u8>>>,
     size: AtomicUsize,
@@ -80,7 +84,7 @@ impl Memtable {
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
         snapshot: SeqNo,
-    ) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    ) -> Vec<ScanRow> {
         // (k, MAX_SEQNO, Put) is the smallest internal key for k and
         // (k, 0, Delete) the largest, so these map user-key bounds onto
         // internal-key bounds.
@@ -96,7 +100,7 @@ impl Memtable {
         };
 
         let map = self.map.read();
-        let mut out: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut out: Vec<ScanRow> = Vec::new();
         // Walk forward from `lo` and stop at the end bound ourselves:
         // BTreeMap::range panics if start > end, and a reversed user range
         // should simply be empty.

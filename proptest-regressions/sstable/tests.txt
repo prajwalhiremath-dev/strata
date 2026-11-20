@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 8d1a123b9c894a87e179f46a412618d31fdeb66edad8fc51a29166e4a600c2b4 # shrinks to ops = [([97], None), ([97], None)], block_size = 21, restart_interval = 1, seeks = []
+cc 7449f519cc0585cbeb9ad0530afaf7c409a41f1d6ec0e32d20dcab7cb1e21a3f # shrinks to ops = [([97], None)], block_size = 16, restart_interval = 1, seeks = [], ranges = [], bloom_bits_per_key = 1

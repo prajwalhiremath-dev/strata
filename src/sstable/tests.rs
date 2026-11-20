@@ -2,6 +2,7 @@
 //! it must answer, and every damaged byte must be caught.
 
 use std::cmp::Ordering;
+use std::ops::Bound;
 use std::path::Path;
 
 use proptest::prelude::*;
@@ -48,6 +49,18 @@ fn user_key() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(b'a'..=b'd', 1..=3)
 }
 
+fn bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
+    prop_oneof![
+        Just(Bound::Unbounded),
+        user_key().prop_map(Bound::Included),
+        user_key().prop_map(Bound::Excluded),
+    ]
+}
+
+fn as_ref(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    b.as_ref().map(Vec::as_slice)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -59,6 +72,8 @@ proptest! {
         block_size in 16usize..=512,
         restart_interval in 1usize..=8,
         seeks in proptest::collection::vec((user_key(), 0u64..320), 0..30),
+        ranges in proptest::collection::vec((bound(), bound(), 0u64..320), 0..10),
+        bloom_bits_per_key in prop_oneof![Just(0usize), 1usize..=12],
     ) {
         let mem = Memtable::new();
         for (i, (k, v)) in ops.iter().enumerate() {
@@ -71,7 +86,7 @@ proptest! {
         let entries: Vec<(Vec<u8>, Vec<u8>)> =
             mem.entries().into_iter().map(|(k, v)| (k.encode(), v)).collect();
         let fs = new_fs();
-        write_table(&fs, "/t/1.sst", &entries, TableOptions { block_size, restart_interval });
+        write_table(&fs, "/t/1.sst", &entries, TableOptions { block_size, restart_interval, bloom_bits_per_key });
 
         // 1. Full iteration gives back exactly what went in.
         prop_assert_eq!(&open_and_scan(&fs, "/t/1.sst").unwrap(), &entries);
@@ -79,6 +94,8 @@ proptest! {
         // 2. Point lookups agree with the memtable at every snapshot.
         let t = open(&fs, "/t/1.sst").unwrap();
         let n = ops.len() as u64;
+        prop_assert_eq!(t.max_seqno(), n, "seqnos are 1..=n");
+        prop_assert_eq!(t.has_filter(), bloom_bits_per_key > 0);
         let mut users: Vec<Vec<u8>> = ops.iter().map(|(k, _)| k.clone()).collect();
         users.extend([b"".to_vec(), b"dddd".to_vec(), b"ab\0".to_vec()]); // never written
         users.sort();
@@ -109,6 +126,15 @@ proptest! {
                 .map(|(k, _)| k.clone());
             prop_assert_eq!(it.valid().then(|| it.key().to_vec()), want);
         }
+
+        // 4. Range scans agree with the memtable.
+        for (lo, hi, snap) in &ranges {
+            prop_assert_eq!(
+                t.scan(as_ref(lo), as_ref(hi), *snap).unwrap(),
+                mem.scan(as_ref(lo), as_ref(hi), *snap),
+                "scan {:?}..{:?} at {}", lo, hi, snap
+            );
+        }
     }
 
     #[test]
@@ -123,6 +149,7 @@ proptest! {
             let f = Footer {
                 index: BlockHandle { offset: off % len, size: size % len },
                 filter: BlockHandle { offset: 0, size: 0 },
+                max_seqno: 0,
             };
             bytes.extend_from_slice(&f.encode());
         }
@@ -153,6 +180,7 @@ fn every_byte_flip_is_detected() {
         TableOptions {
             block_size: 128,
             restart_interval: 16,
+            ..Default::default() // with the bloom filter, so its CRC is covered too
         },
     );
     assert_eq!(open_and_scan(&fs, "/t/good.sst").unwrap(), entries);

@@ -1,35 +1,67 @@
 //! [`Table`]: reads an SSTable written by [`TableBuilder`](super::TableBuilder).
 
+use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::block::{Block, BlockIter};
+use super::bloom::BloomFilter;
 use super::format::{BLOCK_TRAILER_LEN, BlockHandle, FOOTER_LEN, Footer, check_trailer};
 use crate::fs::RandomAccessFile;
 use crate::key::{InternalKey, MAX_SEQNO, SeqNo, ValueKind};
-use crate::memtable::Lookup;
+use crate::memtable::{Lookup, ScanRow};
 use crate::{Error, Result};
 
-/// An open, immutable SSTable. The index block stays in memory; data blocks
-/// are read from the file on demand, one read per block.
+/// An open, immutable SSTable. The index block and the bloom filter stay in
+/// memory; data blocks are read from the file on demand, one read per block.
 pub struct Table {
     file: Box<dyn RandomAccessFile>,
     /// Blocks live in `[0, data_end)`; the footer follows.
     data_end: u64,
     index: Block,
+    filter: Option<BloomFilter>,
+    max_seqno: SeqNo,
+    data_block_reads: AtomicU64,
 }
 
 impl Table {
-    /// Read and verify the footer and the index block.
+    /// Read and verify the footer, the bloom filter and the index block.
     pub fn open(file: Box<dyn RandomAccessFile>) -> Result<Table> {
         let size = file.size()?;
         let data_end = size
             .checked_sub(FOOTER_LEN as u64)
             .ok_or_else(|| Error::Corruption("table: file shorter than a footer".into()))?;
         let footer = Footer::decode(&file.read_at(data_end, FOOTER_LEN)?)?;
-        let index = read_block(file.as_ref(), data_end, footer.index)?;
+        let filter = if footer.filter == (BlockHandle { offset: 0, size: 0 }) {
+            None
+        } else {
+            let contents = read_contents(file.as_ref(), data_end, footer.filter)?;
+            Some(BloomFilter::new(contents)?)
+        };
+        let index = Block::new(read_contents(file.as_ref(), data_end, footer.index)?)?;
         Ok(Table {
             file,
             data_end,
             index,
+            filter,
+            max_seqno: footer.max_seqno,
+            data_block_reads: AtomicU64::new(0),
         })
+    }
+
+    /// Highest sequence number of any entry (0 for an empty table).
+    pub fn max_seqno(&self) -> SeqNo {
+        self.max_seqno
+    }
+
+    /// Whether the table was written with a bloom filter.
+    pub fn has_filter(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    /// Data blocks read from the file since `open` (for tests and the
+    /// chapter 04 experiment).
+    pub fn data_block_reads(&self) -> u64 {
+        self.data_block_reads.load(Ordering::Relaxed)
     }
 
     /// A cursor over every entry, in internal-key order. Starts not valid:
@@ -55,8 +87,17 @@ impl Table {
     }
 
     /// The newest version of `user_key` with seqno <= `snapshot`.
-    #[allow(dead_code)] // the read path calls it from milestone 4
+    #[allow(dead_code)] // the Db read path calls it from Task 4 of milestone 4
     pub(crate) fn get(&self, user_key: &[u8], snapshot: SeqNo) -> Result<Lookup> {
+        // A clear bit in the filter proves the key was never added: no need
+        // to touch a data block.
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|f| !f.may_contain(user_key))
+        {
+            return Ok(Lookup::NotFound);
+        }
         // (user_key, snapshot, Put) sorts before every version of user_key
         // that the snapshot can see, and after every newer one. So the first
         // entry >= it is the newest visible version, if user_key has one.
@@ -76,15 +117,67 @@ impl Table {
         })
     }
 
+    /// Like `Memtable::scan`: the newest version visible at `snapshot` of
+    /// every user key in the range, ascending. `None` marks a tombstone, which
+    /// the caller needs to hide older values in other sources.
+    #[allow(dead_code)] // the Db read path calls it from Task 4 of milestone 4
+    pub(crate) fn scan(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        snapshot: SeqNo,
+    ) -> Result<Vec<ScanRow>> {
+        let mut it = self.iter();
+        // (k, MAX_SEQNO, Put) is the smallest internal key for k and
+        // (k, 0, Delete) the largest.
+        match start {
+            Bound::Included(k) => {
+                it.seek(&InternalKey::new(k, MAX_SEQNO, ValueKind::Put).encode())?
+            }
+            Bound::Excluded(k) => it.seek(&InternalKey::new(k, 0, ValueKind::Delete).encode())?,
+            Bound::Unbounded => it.seek_to_first()?,
+        }
+        let past_end = |k: &[u8]| match end {
+            Bound::Included(e) => k > e,
+            Bound::Excluded(e) => k >= e,
+            Bound::Unbounded => false,
+        };
+        let mut out: Vec<ScanRow> = Vec::new();
+        while it.valid() {
+            let k = InternalKey::decode(it.key())?;
+            if past_end(&k.user_key) {
+                break;
+            }
+            let excluded = matches!(start, Bound::Excluded(s) if s == k.user_key.as_slice());
+            let older = out.last().is_some_and(|(prev, _)| *prev == k.user_key);
+            if !excluded && !older && k.seqno <= snapshot {
+                let value = match k.kind {
+                    ValueKind::Put => Some(it.value().to_vec()),
+                    ValueKind::Delete => None,
+                };
+                out.push((k.user_key, value));
+            }
+            it.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Read a data block (counted in `data_block_reads`).
     fn read_block(&self, handle: BlockHandle) -> Result<Block> {
-        read_block(self.file.as_ref(), self.data_end, handle)
+        self.data_block_reads.fetch_add(1, Ordering::Relaxed);
+        Block::new(read_contents(self.file.as_ref(), self.data_end, handle)?)
     }
 }
 
-/// Read the block at `handle`, check it lies inside `[0, data_end)`, verify
-/// its CRC and decode it. The bounds check comes first, so a corrupt handle
-/// can never make us allocate or read more than the file holds.
-fn read_block(file: &dyn RandomAccessFile, data_end: u64, handle: BlockHandle) -> Result<Block> {
+/// Read the block at `handle`, check it lies inside `[0, data_end)` and
+/// verify its CRC; returns the contents without the trailer. The bounds check
+/// comes first, so a corrupt handle can never make us allocate or read more
+/// than the file holds.
+fn read_contents(
+    file: &dyn RandomAccessFile,
+    data_end: u64,
+    handle: BlockHandle,
+) -> Result<Vec<u8>> {
     let in_bounds = handle
         .offset
         .checked_add(handle.size)
@@ -100,7 +193,7 @@ fn read_block(file: &dyn RandomAccessFile, data_end: u64, handle: BlockHandle) -
     let mut buf = file.read_at(handle.offset, len)?;
     check_trailer(&buf)?;
     buf.truncate(handle.size as usize);
-    Block::new(buf)
+    Ok(buf)
 }
 
 /// A two-level cursor: the index iterator picks the data block, the data
@@ -238,7 +331,144 @@ mod tests {
         TableOptions {
             block_size,
             restart_interval,
+            ..Default::default()
         }
+    }
+
+    /// 1000 keys "k0000".."k0999" (each with a "0" appended), 3 bytes each.
+    fn thousand(bloom_bits_per_key: usize) -> Table {
+        let entries: Vec<_> = (0..1000u32)
+            .map(|i| (put(format!("k{i:04}0").as_bytes(), 1), b"val".to_vec()))
+            .collect();
+        build(
+            &entries,
+            TableOptions {
+                bloom_bits_per_key,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn filter_skips_missing_keys() {
+        let t = thousand(10);
+        assert!(t.has_filter());
+        let before = t.data_block_reads();
+        for i in 0..1000u32 {
+            // Inside the key range, so only the filter can rule them out.
+            let absent = format!("k{i:04}5");
+            assert_eq!(
+                t.get(absent.as_bytes(), MAX_SEQNO).unwrap(),
+                Lookup::NotFound
+            );
+        }
+        let reads = t.data_block_reads() - before;
+        assert!(reads < 50, "{reads} data blocks read for 1000 absent keys");
+    }
+
+    #[test]
+    fn present_keys_still_found() {
+        let t = thousand(10);
+        for i in 0..1000u32 {
+            let k = format!("k{i:04}0");
+            assert_eq!(
+                t.get(k.as_bytes(), MAX_SEQNO).unwrap(),
+                Lookup::Found(b"val".to_vec()),
+                "{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_filter_reads_blocks() {
+        let t = thousand(0);
+        assert!(!t.has_filter());
+        let before = t.data_block_reads();
+        // 0..999: "k09995" sorts after the last key, so the index alone rules
+        // it out. Every probe inside the range must read its block.
+        for i in 0..999u32 {
+            let absent = format!("k{i:04}5");
+            assert_eq!(
+                t.get(absent.as_bytes(), MAX_SEQNO).unwrap(),
+                Lookup::NotFound
+            );
+        }
+        assert!(t.data_block_reads() - before >= 999);
+    }
+
+    #[test]
+    fn max_seqno_is_read_back() {
+        let t = build(
+            &[(put(b"a", 4), vec![]), (put(b"b", 11), vec![])],
+            TableOptions::default(),
+        );
+        assert_eq!(t.max_seqno(), 11);
+    }
+
+    #[test]
+    fn scan_ranges() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let t = build(
+            &[
+                (put(b"a", 1), b"a1".to_vec()),
+                (put(b"b", 6), b"b6".to_vec()),
+                (put(b"b", 2), b"b2".to_vec()),
+                (key(b"c", 5, ValueKind::Delete), vec![]),
+                (put(b"c", 3), b"c3".to_vec()),
+                (put(b"d", 4), b"d4".to_vec()),
+            ],
+            opts(32, 2),
+        );
+        let some = |v: &[u8]| Some(v.to_vec());
+        let row = |k: &[u8], v: Option<Vec<u8>>| (k.to_vec(), v);
+        assert_eq!(
+            t.scan(Unbounded, Unbounded, MAX_SEQNO).unwrap(),
+            vec![
+                row(b"a", some(b"a1")),
+                row(b"b", some(b"b6")),
+                row(b"c", None),
+                row(b"d", some(b"d4")),
+            ]
+        );
+        assert_eq!(
+            t.scan(Included(b"b"), Excluded(b"d"), MAX_SEQNO).unwrap(),
+            vec![row(b"b", some(b"b6")), row(b"c", None)]
+        );
+        assert_eq!(
+            t.scan(Excluded(b"b"), Included(b"d"), MAX_SEQNO).unwrap(),
+            vec![row(b"c", None), row(b"d", some(b"d4"))]
+        );
+        assert_eq!(
+            t.scan(Unbounded, Unbounded, 4).unwrap(),
+            vec![
+                row(b"a", some(b"a1")),
+                row(b"b", some(b"b2")),
+                row(b"c", some(b"c3")),
+                row(b"d", some(b"d4")),
+            ],
+            "snapshot 4 sees the older versions"
+        );
+        assert!(
+            t.scan(Included(b"d"), Included(b"a"), MAX_SEQNO)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(t.scan(Unbounded, Unbounded, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn filter_handle_out_of_range() {
+        let footer = Footer {
+            index: BlockHandle { offset: 0, size: 8 },
+            filter: BlockHandle {
+                offset: 4,
+                size: 100,
+            },
+            max_seqno: 0,
+        };
+        let mut file = vec![0u8; 12];
+        file.extend_from_slice(&footer.encode());
+        assert!(matches!(open_bytes(&file), Err(Error::Corruption(_))));
     }
 
     #[test]
@@ -358,7 +588,7 @@ mod tests {
 
     #[test]
     fn file_too_short() {
-        assert!(matches!(open_bytes(&[0; 47]), Err(Error::Corruption(_))));
+        assert!(matches!(open_bytes(&[0; 55]), Err(Error::Corruption(_))));
         assert!(matches!(open_bytes(&[]), Err(Error::Corruption(_))));
     }
 
@@ -374,6 +604,7 @@ mod tests {
             let footer = Footer {
                 index: BlockHandle { offset, size },
                 filter: BlockHandle { offset: 0, size: 0 },
+                max_seqno: 0,
             };
             let mut file = vec![0u8; 8];
             file.extend_from_slice(&footer.encode());

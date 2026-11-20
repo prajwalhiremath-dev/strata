@@ -74,6 +74,8 @@ end of file
 
 The reader starts at the **end**: the footer has a fixed size, so it's always the last 48 bytes. The footer says where the index is. The index says where each data block is.
 
+> **Changed in milestone 4.** A filter block now sits between the last data block and the index, and the footer is 56 bytes. Section 3.8 has the details.
+
 ### 3.2 Varints
 
 Most lengths in a block are small: a key of 21 bytes, a value of 16. Storing each as a 4-byte `u32` would waste space, so we use **varints** (LEB128). Each byte carries 7 bits of the number, and its high bit means "more bytes follow":
@@ -183,6 +185,14 @@ index_offset u64 | index_size u64 | filter_offset u64 | filter_size u64 | versio
 - The **magic** (`strataT1`) answers "is this a strata table at all?"
 - The footer's own **CRC** covers the four handles and the version. Without it, a flipped bit in `index_offset` would send us to read garbage.
 - The **filter handle** is reserved for milestone 4's bloom filter. It's zero for now, and the reader rejects anything else, so no byte of the file goes unchecked. Reserving it now means M4 won't need a new file format.
+
+> **Changed in milestone 4: that last sentence turned out wrong.** The filter itself did fit in the reserved handle. But M4 also needs each table to record its highest sequence number (`max_seqno`). Once flushing deletes the logs, the footer is the only place `open` can learn where the sequence counter stands. That's a new field, so the footer became format **version 2**, 56 bytes:
+>
+> ```text
+> index handle (16) | filter handle (16) | max_seqno u64 | version u32 = 2 | crc32 (over 0..44) | magic
+> ```
+>
+> The filter handle is now either `(0, 0)` (no filter) or points at a real block with its own CRC. Version 1 tables are rejected with "unsupported format version 1". The lesson: reserving a slot only saves a format change for the feature you predicted. A version number is what saves you from the ones you didn't. Chapter 04 covers the filter and `max_seqno`.
 
 Every byte of a table is therefore covered by a CRC or a fixed value. `every_byte_flip_is_detected` proves it: it flips each byte of a real table in turn (about 6,400 positions) and requires that opening plus a full scan returns an error, every time.
 

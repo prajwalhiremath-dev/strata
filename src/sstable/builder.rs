@@ -3,9 +3,10 @@
 use std::cmp::Ordering;
 
 use super::block::BlockBuilder;
+use super::bloom;
 use super::format::{BlockHandle, Footer, append_trailer};
 use crate::fs::WritableFile;
-use crate::key::{InternalKey, compare_encoded};
+use crate::key::{InternalKey, SeqNo, compare_encoded};
 use crate::{Error, Result};
 
 /// Largest allowed `block_size`. Offsets inside a block are `u32`, so a
@@ -28,6 +29,9 @@ pub struct TableOptions {
     pub block_size: usize,
     /// Store a full key every this many entries (chapter 03).
     pub restart_interval: usize,
+    /// Bloom filter size per distinct user key, in bits (chapter 04). 10
+    /// gives about a 1% false-positive rate; 0 writes no filter.
+    pub bloom_bits_per_key: usize,
 }
 
 impl Default for TableOptions {
@@ -35,6 +39,7 @@ impl Default for TableOptions {
         TableOptions {
             block_size: 4096,
             restart_interval: 16,
+            bloom_bits_per_key: 10,
         }
     }
 }
@@ -47,6 +52,8 @@ pub struct TableMeta {
     /// First and last encoded internal key; empty when `num_entries == 0`.
     pub smallest: Vec<u8>,
     pub largest: Vec<u8>,
+    /// Highest sequence number of any entry; 0 when `num_entries == 0`.
+    pub max_seqno: SeqNo,
 }
 
 /// Writes a table from entries added in increasing internal-key order.
@@ -66,6 +73,10 @@ pub struct TableBuilder {
     num_entries: u64,
     smallest: Vec<u8>,
     last_key: Vec<u8>,
+    max_seqno: SeqNo,
+    /// `bloom::hash64` of each distinct user key, in order (empty when the
+    /// table has no filter).
+    key_hashes: Vec<u64>,
     /// Set by a failed write: the file may end mid-block, so refuse to go on.
     failed: bool,
 }
@@ -91,6 +102,8 @@ impl TableBuilder {
             num_entries: 0,
             smallest: Vec::new(),
             last_key: Vec::new(),
+            max_seqno: 0,
+            key_hashes: Vec::new(),
             failed: false,
         })
     }
@@ -99,7 +112,7 @@ impl TableBuilder {
     /// greater (in internal-key order) than the previous one.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_usable()?;
-        InternalKey::decode(key)
+        let parsed = InternalKey::decode(key)
             .map_err(|_| Error::InvalidArgument("not an encoded internal key".into()))?;
         // Block entries store lengths as u32.
         if key.len() > MAX_ENTRY_PART || value.len() > MAX_ENTRY_PART {
@@ -112,9 +125,17 @@ impl TableBuilder {
                 "keys must be added in strictly increasing internal-key order".into(),
             ));
         }
+        // The filter answers "might this *user* key be here?": a reader asks
+        // for a user key at some snapshot and doesn't know which seqnos
+        // exist. Versions of one user key are adjacent, so each is hashed once.
+        let new_user_key = self.num_entries == 0 || user_key(&self.last_key) != parsed.user_key;
+        if self.opts.bloom_bits_per_key > 0 && new_user_key {
+            self.key_hashes.push(bloom::hash64(&parsed.user_key));
+        }
         if self.num_entries == 0 {
             self.smallest = key.to_vec();
         }
+        self.max_seqno = self.max_seqno.max(parsed.seqno);
         self.data.add(key, value);
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
@@ -125,18 +146,25 @@ impl TableBuilder {
         Ok(())
     }
 
-    /// Write the last data block, the (empty) filter, the index and the
-    /// footer, then sync the file.
+    /// Write the last data block, the filter, the index and the footer, then
+    /// sync the file.
     pub fn finish(mut self) -> Result<TableMeta> {
         self.check_usable()?;
         if !self.data.is_empty() {
             self.flush_data_block()?;
         }
+        let filter = if self.opts.bloom_bits_per_key > 0 {
+            let contents = bloom::build(&self.key_hashes, self.opts.bloom_bits_per_key);
+            self.write_block(contents)?
+        } else {
+            BlockHandle { offset: 0, size: 0 }
+        };
         let index_contents = self.index.finish();
         let index = self.write_block(index_contents)?;
         let footer = Footer {
             index,
-            filter: BlockHandle { offset: 0, size: 0 },
+            filter,
+            max_seqno: self.max_seqno,
         };
         self.append(&footer.encode())?;
         self.file.sync()?;
@@ -149,6 +177,7 @@ impl TableBuilder {
             } else {
                 self.last_key
             },
+            max_seqno: self.max_seqno,
         })
     }
 
@@ -192,6 +221,11 @@ impl TableBuilder {
     }
 }
 
+/// The user-key part of an encoded internal key the builder already checked.
+fn user_key(encoded: &[u8]) -> &[u8] {
+    &encoded[..encoded.len() - 8]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,7 +266,10 @@ mod tests {
     #[test]
     fn default_options() {
         let o = TableOptions::default();
-        assert_eq!((o.block_size, o.restart_interval), (4096, 16));
+        assert_eq!(
+            (o.block_size, o.restart_interval, o.bloom_bits_per_key),
+            (4096, 16, 10)
+        );
     }
 
     #[test]
@@ -284,14 +321,32 @@ mod tests {
 
     #[test]
     fn empty_table_layout() {
-        let (fs, b) = setup(TableOptions::default());
+        let (fs, b) = setup(TableOptions {
+            bloom_bits_per_key: 0,
+            ..Default::default()
+        });
         let meta = b.finish().unwrap();
-        assert_eq!(meta.file_size, 8 + 4 + 48);
+        // An empty index block (8 bytes) + its CRC + the footer.
+        assert_eq!(meta.file_size, 8 + 4 + 56);
         assert_eq!(meta.num_entries, 0);
+        assert_eq!(meta.max_seqno, 0);
         assert!(meta.smallest.is_empty() && meta.largest.is_empty());
         let file = fs.read(Path::new("/t/1.sst")).unwrap();
-        assert_eq!(file.len(), 60);
+        assert_eq!(file.len(), 68);
         assert_eq!(index_entries(&file), 0);
+
+        // With a filter: the minimum 8-byte bit array + k, and its CRC.
+        let (_fs, b) = setup(TableOptions::default());
+        assert_eq!(b.finish().unwrap().file_size, 8 + 4 + 56 + (9 + 4));
+    }
+
+    #[test]
+    fn meta_max_seqno() {
+        let (_fs, mut b) = setup(TableOptions::default());
+        b.add(&ik(b"a", 5), b"").unwrap();
+        b.add(&ik(b"b", 9), b"").unwrap();
+        b.add(&ik(b"c", 3), b"").unwrap();
+        assert_eq!(b.finish().unwrap().max_seqno, 9);
     }
 
     #[test]
