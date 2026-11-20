@@ -21,17 +21,16 @@ pub(crate) enum FileKind {
 /// Parse a file name strata created. Anything else (including `LOCK`) is
 /// `None` and left alone.
 pub(crate) fn parse_file_name(name: &str) -> Option<(u64, FileKind)> {
-    // ".sst.tmp" first: it also ends in neither ".sst" nor ".log", but being
-    // explicit keeps the three cases obviously disjoint.
-    let (stem, kind) = if let Some(s) = name.strip_suffix(".sst.tmp") {
-        (s, FileKind::TempTable)
-    } else if let Some(s) = name.strip_suffix(".sst") {
-        (s, FileKind::Table)
-    } else if let Some(s) = name.strip_suffix(".log") {
-        (s, FileKind::Log)
-    } else {
-        return None;
-    };
+    // ".sst.tmp" before ".sst" is not needed (".sst.tmp" doesn't end in
+    // ".sst"), but listing it first keeps the cases obviously disjoint.
+    const KINDS: [(&str, FileKind); 3] = [
+        (".sst.tmp", FileKind::TempTable),
+        (".sst", FileKind::Table),
+        (".log", FileKind::Log),
+    ];
+    let (stem, kind) = KINDS
+        .iter()
+        .find_map(|&(suffix, kind)| Some((name.strip_suffix(suffix)?, kind)))?;
     // `u64::from_str` accepts a leading '+'; we only ever write digits.
     if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
         return None;
