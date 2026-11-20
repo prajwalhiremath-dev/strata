@@ -58,6 +58,17 @@ impl Table {
         self.filter.is_some()
     }
 
+    /// What the bloom filter says about `user_key`: `false` means it is
+    /// certainly not in the table. Always `true` without a filter.
+    pub fn may_contain(&self, user_key: &[u8]) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.may_contain(user_key))
+    }
+
+    /// The filter's number of probes `k`, if the table has a filter.
+    pub fn filter_probes(&self) -> Option<u32> {
+        self.filter.as_ref().map(BloomFilter::probes)
+    }
+
     /// Data blocks read from the file since `open` (for tests and the
     /// chapter 04 experiment).
     pub fn data_block_reads(&self) -> u64 {

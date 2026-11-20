@@ -96,6 +96,10 @@ impl BloomFilter {
         Ok(BloomFilter { bits: contents, k })
     }
 
+    pub(crate) fn probes(&self) -> u32 {
+        self.k
+    }
+
     /// `false` means the key was certainly never added.
     pub(crate) fn may_contain(&self, key: &[u8]) -> bool {
         let m_bits = self.bits.len() as u64 * 8;

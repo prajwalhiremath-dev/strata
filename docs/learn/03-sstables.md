@@ -170,7 +170,7 @@ The table iterator is two cursors stacked: the index cursor picks a block, and a
 2. `seek(target)` gives the first entry ≥ target.
 3. If that entry's **user key** equals `user_key`, it's the newest visible version: return `Found(value)` for a Put, or `Deleted` for a tombstone. Otherwise the key isn't in this table, so return `NotFound`.
 
-Step 3's equality check matters: without it, `get("aa")` would happily return the value of `"ab"`. Like the memtable, a table answers `Deleted` and `NotFound` differently. From milestone 6 a `Deleted` stops the search, while a `NotFound` means "look in older tables".
+Step 3's equality check matters: without it, `get("aa")` would happily return the value of `"ab"`. Like the memtable, a table answers `Deleted` and `NotFound` differently. From milestone 4 (chapter 04) a `Deleted` stops the search, while a `NotFound` means "look in older tables".
 
 ### 3.8 Checksums, and a footer that checks itself
 
@@ -194,7 +194,7 @@ index_offset u64 | index_size u64 | filter_offset u64 | filter_size u64 | versio
 >
 > The filter handle is now either `(0, 0)` (no filter) or points at a real block with its own CRC. Version 1 tables are rejected with "unsupported format version 1". The lesson: reserving a slot only saves a format change for the feature you predicted. A version number is what saves you from the ones you didn't. Chapter 04 covers the filter and `max_seqno`.
 
-Every byte of a table is therefore covered by a CRC or a fixed value. `every_byte_flip_is_detected` proves it: it flips each byte of a real table in turn (about 6,400 positions) and requires that opening plus a full scan returns an error, every time.
+Every byte of a table is therefore covered by a CRC or a fixed value. `every_byte_flip_is_detected` proves it: it flips each byte of a real table in turn (about 6,400 positions in milestone 3; 6,835 since milestone 4 added the filter block) and requires that opening plus a full scan returns an error, every time.
 
 ### 3.9 Never trust a length from disk
 
@@ -275,6 +275,8 @@ What production engines add on top of this design:
    | 4 | 3,237,384 | −27.2% | 782 | 3,745 – 5,214 |
    | 16 | 2,941,888 | −33.8% | 710 | 3,570 – 6,119 |
    | 64 | 2,872,647 | −35.4% | 695 | 5,514 – 7,191 |
+
+   These are milestone 3's numbers. Since milestone 4 each file also carries a bloom filter, about 125 KB at the default 10 bits per key, so every size is that much larger and the percentages shrink slightly (−26.4%, −32.9%, −34.4%).
 
    Most of the saving comes by interval 16, and going to 64 saves only 1.6% more while making every lookup slower. Up to 16, the differences in lookup time are within run-to-run noise, because the cost is dominated by reading and checksumming a 4 KiB block. That's what a block cache attacks.
 2. **Read the hex dump** the experiment prints. Find the shared prefix length and the trailer in each entry.
