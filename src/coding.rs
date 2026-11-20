@@ -31,7 +31,6 @@ pub(crate) fn get_varint32(src: &[u8]) -> Result<(u32, usize)> {
     Ok((v as u32, n))
 }
 
-#[allow(dead_code)] // the table reader (next task) uses it
 pub(crate) fn get_varint64(src: &[u8]) -> Result<(u64, usize)> {
     get_varint(src, 64)
 }

@@ -23,6 +23,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::coding::{get_varint32, put_varint32};
 use crate::key::compare_encoded;
@@ -115,8 +116,11 @@ impl BlockBuilder {
 
 /// A decoded block: the raw contents plus where the restart array starts.
 /// `new` checks the restart array; entries are checked as they're decoded.
+///
+/// Cloning is cheap (the bytes are shared), so an iterator can own its block.
+#[derive(Clone)]
 pub(crate) struct Block {
-    data: Vec<u8>,
+    data: Arc<[u8]>,
     /// Entries live in `data[..restarts_offset]`.
     restarts_offset: usize,
     num_restarts: usize,
@@ -139,7 +143,7 @@ impl Block {
             .ok_or_else(|| corrupt("restart count larger than the block"))?;
         let restarts_offset = data.len() - tail;
         let block = Block {
-            data,
+            data: data.into(),
             restarts_offset,
             num_restarts: n,
         };
@@ -165,9 +169,9 @@ impl Block {
         read_u32(&self.data, self.restarts_offset + 4 * i) as usize
     }
 
-    pub(crate) fn iter(&self) -> BlockIter<'_> {
+    pub(crate) fn iter(&self) -> BlockIter {
         BlockIter {
-            block: self,
+            block: self.clone(),
             next: self.restarts_offset,
             restart_index: 0,
             key: Vec::new(),
@@ -210,8 +214,8 @@ impl Block {
 }
 
 /// A cursor over one block's entries.
-pub(crate) struct BlockIter<'a> {
-    block: &'a Block,
+pub(crate) struct BlockIter {
+    block: Block,
     /// Offset of the entry after the current one.
     next: usize,
     /// Index of the restart region the cursor is in.
@@ -222,7 +226,7 @@ pub(crate) struct BlockIter<'a> {
     valid: bool,
 }
 
-impl BlockIter<'_> {
+impl BlockIter {
     pub(crate) fn valid(&self) -> bool {
         self.valid
     }
@@ -292,7 +296,7 @@ impl BlockIter<'_> {
             self.valid = false;
             return Ok(());
         }
-        let b = self.block;
+        let b = &self.block;
         while self.restart_index + 1 < b.num_restarts
             && b.restart_point(self.restart_index + 1) <= at
         {
@@ -436,7 +440,7 @@ mod tests {
         for interval in [1, 2, 16] {
             let block = Block::new(build(&ks, interval)).unwrap();
             let mut it = block.iter();
-            let seek = |it: &mut BlockIter<'_>, k: &[u8]| {
+            let seek = |it: &mut BlockIter, k: &[u8]| {
                 it.seek(&ik(k, 1)).unwrap();
                 it.valid().then(|| it.key().to_vec())
             };
