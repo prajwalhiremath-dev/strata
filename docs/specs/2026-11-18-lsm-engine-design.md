@@ -164,6 +164,20 @@ This is what makes crash testing possible without pulling the power cord.
 - The index stores each block's full last key. LevelDB's shorter separator keys are explained but not implemented.
 - No block cache yet. Every block read goes to the file.
 
+**Milestone 4 additions** (decided while planning M4):
+- `FileSystem::rename(from, to)` is atomic and, like create and remove, durable only after `sync_dir`.
+- **File names** share one number space: logs are `{n:06}.log`, tables `{n:06}.sst`. A table is written as `{n:06}.sst.tmp`, then `finish` (which syncs it), `rename` to `{n:06}.sst`, `sync_dir`. Only then is it published to readers, and only then is the log it came from removed (followed by another `sync_dir`). Leftover `*.sst.tmp` files are deleted at open. A table is never written from an empty memtable.
+- **Footer v2** is 56 bytes: `index handle (16) | filter handle (16) | max_seqno u64 | version u32 = 2 | crc32 over bytes 0..44 | magic strataT1`. `max_seqno` is the highest sequence number in the table, so open can restore the sequence counter after every log is gone. Version 1 files are rejected.
+- **Bloom filter** over user keys (consecutive duplicates added once). Hash: `fmix64(fnv1a64(key))`. Probes by double hashing: `delta = (h >> 32) | 1`, bit `i` is `(h + i·delta) mod m_bits` in wrapping u64 arithmetic. `k = clamp(round(bits_per_key · ln 2), 1, 30)`. Block layout: `bit array (m = max(ceil(n · bits_per_key / 8), 8) bytes) | k u8`, with the usual CRC trailer. `bloom_bits_per_key = 0` writes no filter (handle `(0, 0)`).
+- **Replay skip invariant:** every seqno ≤ `table_max` (the largest `max_seqno` of any table) is in some table, because a flush always writes the whole memtable, a memtable holds every seqno since the previous flush, and rotation happens only under the writer lock between batches. Replay therefore skips entries with seqno ≤ `table_max`. After open, `last_seqno = max(table_max, highest seqno replayed)`.
+- **Read order:** load `visible_seqno` first, then the read state `{mem, imm, tables newest-first}`. `get` stops at the first `Found` or `Deleted`. `scan` merges all sources, newest wins per user key, and drops tombstones after merging.
+- **Deviations in M4:**
+  - **Flush runs on the writer's thread.** A write that triggers it waits for it. The background flush thread arrives in M8 with group commit.
+  - **`scan` collects the results from every source into memory** before returning them. Streaming merging iterators are M6.
+  - **L0 grows without bound.** Every flush adds a table and reads check all of them. Compaction is M7.
+  - **The directory listing is the source of truth for live tables** until the manifest in M5. It works for adding one file at a time. It can't express "replace these five files with these three" atomically, which compaction needs. That's the motivation for M5.
+  - **The table footer grows from 48 to 56 bytes, and the format version goes from 1 to 2.** Chapter 03 said M4 wouldn't need a new format. That was true for the filter, but storing `max_seqno` does need one, and the chapter gets a correction.
+
 ## 6. Testing strategy
 
 Correctness comes first, so these tests run from milestone 1:

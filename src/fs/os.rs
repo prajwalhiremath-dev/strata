@@ -115,6 +115,13 @@ impl FileSystem for OsFs {
         Ok(())
     }
 
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        // rename(2) is atomic: anyone looking sees the old name or the new
+        // one, never neither, and never a half-written target.
+        fs::rename(from, to)?;
+        Ok(())
+    }
+
     fn sync_dir(&self, dir: &Path) -> Result<()> {
         // A directory is a file listing names -> inodes. Syncing it makes
         // creations/removals/renames in it durable.
@@ -171,6 +178,20 @@ mod tests {
         assert_eq!(r.size().unwrap(), 11);
         assert!(r.read_at(8, 5).is_err(), "past the end");
         assert!(fs.open_random(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn os_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = OsFs;
+        let (a, b) = (dir.path().join("1.sst.tmp"), dir.path().join("1.sst"));
+        fs.create(&a).unwrap().append(b"table").unwrap();
+        fs.rename(&a, &b).unwrap();
+        fs.sync_dir(dir.path()).unwrap();
+        assert_eq!(fs.read(&b).unwrap(), b"table");
+        assert!(fs.read(&a).is_err());
+        assert_eq!(fs.list(dir.path()).unwrap(), vec!["1.sst".to_string()]);
+        assert!(fs.rename(&a, &b).is_err(), "source is gone");
     }
 
     #[test]

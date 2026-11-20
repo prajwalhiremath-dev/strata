@@ -194,7 +194,8 @@ impl SimFs {
     }
 
     /// After `n` more mutating calls (create, append, sync, sync_dir,
-    /// remove), the simulated process dies: every further mutating call fails
+    /// remove, rename), the simulated process dies: every further mutating
+    /// call fails
     /// and changes nothing, until one of the `crash*` methods is called.
     pub fn kill_after(&self, n: usize) {
         self.state.lock().kill_after = Some(n);
@@ -404,6 +405,36 @@ impl FileSystem for SimFs {
         Ok(())
     }
 
+    /// Two simplifications, neither of which strata relies on: renaming a
+    /// file that still has an open writer isn't modelled (the old handle
+    /// keeps writing to the old name), and an unsynced rename onto an
+    /// existing file is undone by a crash as far as names go, but the target
+    /// keeps the new contents. strata only renames finished tables onto fresh
+    /// names.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut st = self.state.lock();
+        st.mutate()?;
+        if !st.is_live(from) {
+            return Err(not_found(from));
+        }
+        let (to_dir, to_name) = split(to);
+        if !st.live.contains_key(&to_dir) {
+            return Err(not_found(&to_dir));
+        }
+        let src = &st.files[from];
+        let copy = SimFile {
+            data: src.data.clone(),
+            synced_len: src.synced_len,
+        };
+        st.files.insert(to.to_path_buf(), copy);
+        // As with `remove`, `from`'s contents stay in `files`: if a crash
+        // restores the durable names, the old name comes back with them.
+        let (from_dir, from_name) = split(from);
+        st.live.get_mut(&from_dir).map(|s| s.remove(&from_name));
+        st.live.get_mut(&to_dir).map(|s| s.insert(to_name));
+        Ok(())
+    }
+
     fn sync_dir(&self, dir: &Path) -> Result<()> {
         let mut st = self.state.lock();
         st.mutate()?;
@@ -608,6 +639,75 @@ mod tests {
         fs.crash();
         let mut g = fs.create(&p).unwrap();
         g.append(b"alive").unwrap();
+    }
+
+    fn synced_file(fs: &SimFs, p: &Path, data: &[u8]) {
+        let mut f = fs.create(p).unwrap();
+        f.append(data).unwrap();
+        f.sync().unwrap();
+        fs.sync_dir(dir()).unwrap();
+    }
+
+    #[test]
+    fn rename_moves_contents() {
+        let (fs, p) = setup();
+        let q = dir().join("b.sst");
+        synced_file(&fs, &p, b"abc");
+        fs.rename(&p, &q).unwrap();
+        assert_eq!(fs.read(&q).unwrap(), b"abc");
+        assert!(fs.read(&p).is_err());
+        assert_eq!(fs.list(dir()).unwrap(), vec!["b.sst".to_string()]);
+    }
+
+    #[test]
+    fn unsynced_rename_undone_by_crash() {
+        let (fs, p) = setup();
+        let q = dir().join("b.sst");
+        synced_file(&fs, &p, b"abc");
+        fs.rename(&p, &q).unwrap();
+        fs.crash();
+        assert_eq!(fs.read(&p).unwrap(), b"abc");
+        assert!(fs.read(&q).is_err());
+        assert_eq!(fs.list(dir()).unwrap(), vec!["a.log".to_string()]);
+    }
+
+    #[test]
+    fn synced_rename_survives_crash() {
+        let (fs, p) = setup();
+        let q = dir().join("b.sst");
+        synced_file(&fs, &p, b"abc");
+        fs.rename(&p, &q).unwrap();
+        fs.sync_dir(dir()).unwrap();
+        fs.crash();
+        assert_eq!(fs.read(&q).unwrap(), b"abc");
+        assert_eq!(fs.list(dir()).unwrap(), vec!["b.sst".to_string()]);
+    }
+
+    #[test]
+    fn rename_replaces_target() {
+        let (fs, p) = setup();
+        let q = dir().join("b.sst");
+        synced_file(&fs, &p, b"new");
+        synced_file(&fs, &q, b"old");
+        fs.rename(&p, &q).unwrap();
+        assert_eq!(fs.read(&q).unwrap(), b"new");
+        assert_eq!(fs.list(dir()).unwrap(), vec!["b.sst".to_string()]);
+    }
+
+    #[test]
+    fn rename_counts_for_kill_after() {
+        let (fs, p) = setup();
+        synced_file(&fs, &p, b"abc");
+        fs.kill_after(0);
+        assert!(fs.rename(&p, &dir().join("b.sst")).is_err());
+        fs.crash();
+        assert_eq!(fs.list(dir()).unwrap(), vec!["a.log".to_string()]);
+    }
+
+    #[test]
+    fn rename_missing_is_err() {
+        let (fs, p) = setup();
+        assert!(fs.rename(&p, &dir().join("b.sst")).is_err());
     }
 
     #[test]

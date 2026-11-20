@@ -66,8 +66,14 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
 
     fn remove(&self, path: &Path) -> Result<()>;
 
+    /// Atomically rename `from` to `to`, replacing `to` if it exists.
+    /// Like a create or remove, it is durable only after [`sync_dir`].
+    ///
+    /// [`sync_dir`]: FileSystem::sync_dir
+    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+
     /// Make the directory's entries durable: files created in or removed from
-    /// `dir` are only guaranteed to stay created/removed after this.
+    /// `dir` are only guaranteed to stay created/removed/renamed after this.
     fn sync_dir(&self, dir: &Path) -> Result<()>;
 
     /// Take an exclusive lock on `path` (creating it if needed). Fails with
