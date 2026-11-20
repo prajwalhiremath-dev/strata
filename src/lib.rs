@@ -24,6 +24,7 @@ pub mod fs;
 pub mod key;
 mod memtable;
 mod options;
+pub mod sstable;
 mod wal;
 
 pub use batch::{MAX_VALUE_LEN, WriteBatch};
