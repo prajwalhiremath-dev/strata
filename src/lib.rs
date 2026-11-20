@@ -17,6 +17,7 @@
 //! ```
 
 mod batch;
+mod coding;
 mod db;
 mod error;
 pub mod fs;

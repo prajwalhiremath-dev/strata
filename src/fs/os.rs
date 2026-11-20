@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::Path;
 
-use super::{FileLock, FileSystem, WritableFile};
+use super::{FileLock, FileSystem, RandomAccessFile, WritableFile};
 use crate::{Error, Result};
 
 /// The operating system's filesystem.
@@ -24,6 +24,45 @@ impl WritableFile for OsFile {
         // cache. Plain fsync() there only hands data to the drive.
         self.0.sync_all()?;
         Ok(())
+    }
+}
+
+/// Read-only handle. On unix `read_exact_at` is `pread`: it takes the offset
+/// as an argument, so concurrent readers don't fight over a file cursor.
+#[cfg(unix)]
+struct OsRandomFile(File);
+
+#[cfg(unix)]
+impl RandomAccessFile for OsRandomFile {
+    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0; len];
+        self.0.read_exact_at(&mut buf, offset)?;
+        Ok(buf)
+    }
+
+    fn size(&self) -> Result<u64> {
+        Ok(self.0.metadata()?.len())
+    }
+}
+
+/// Portable fallback: one cursor behind a mutex (seek, then read).
+#[cfg(not(unix))]
+struct OsRandomFile(parking_lot::Mutex<File>);
+
+#[cfg(not(unix))]
+impl RandomAccessFile for OsRandomFile {
+    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = self.0.lock();
+        let mut buf = vec![0; len];
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn size(&self) -> Result<u64> {
+        Ok(self.0.lock().metadata()?.len())
     }
 }
 
@@ -49,6 +88,14 @@ impl FileSystem for OsFs {
 
     fn read(&self, path: &Path) -> Result<Vec<u8>> {
         Ok(fs::read(path)?)
+    }
+
+    fn open_random(&self, path: &Path) -> Result<Box<dyn RandomAccessFile>> {
+        let f = File::open(path)?;
+        #[cfg(unix)]
+        return Ok(Box::new(OsRandomFile(f)));
+        #[cfg(not(unix))]
+        return Ok(Box::new(OsRandomFile(parking_lot::Mutex::new(f))));
     }
 
     fn list(&self, dir: &Path) -> Result<Vec<String>> {
@@ -109,6 +156,21 @@ mod tests {
         assert_eq!(fs.list(dir.path()).unwrap(), vec!["000001.log".to_string()]);
         fs.remove(&p).unwrap();
         assert!(fs.list(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn os_read_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = OsFs;
+        let p = dir.path().join("t.sst");
+        let mut f = fs.create(&p).unwrap();
+        f.append(b"hello world").unwrap();
+        f.sync().unwrap();
+        let r = fs.open_random(&p).unwrap();
+        assert_eq!(r.read_at(6, 5).unwrap(), b"world");
+        assert_eq!(r.size().unwrap(), 11);
+        assert!(r.read_at(8, 5).is_err(), "past the end");
+        assert!(fs.open_random(&dir.path().join("missing")).is_err());
     }
 
     #[test]

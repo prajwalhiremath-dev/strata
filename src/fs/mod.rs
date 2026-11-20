@@ -32,6 +32,19 @@ pub trait WritableFile: Send {
     fn sync(&mut self) -> Result<()>;
 }
 
+/// A file opened for reading at arbitrary offsets (SSTables).
+///
+/// `&self`, not `&mut self`: there is no shared cursor, so many readers can
+/// use one handle at once (POSIX `pread`).
+pub trait RandomAccessFile: Send + Sync {
+    /// Exactly `len` bytes starting at `offset`. Reading past the end is an
+    /// error, never a short read.
+    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
+
+    /// Current length of the file in bytes.
+    fn size(&self) -> Result<u64>;
+}
+
 /// An exclusive lock on a file; released when dropped.
 pub trait FileLock: Send {}
 
@@ -44,6 +57,9 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
 
     /// Read a whole file.
     fn read(&self, path: &Path) -> Result<Vec<u8>>;
+
+    /// Open an existing file for random-access reads.
+    fn open_random(&self, path: &Path) -> Result<Box<dyn RandomAccessFile>>;
 
     /// Names (not paths) of the files in `dir`, sorted.
     fn list(&self, dir: &Path) -> Result<Vec<String>>;

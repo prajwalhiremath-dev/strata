@@ -156,6 +156,14 @@ This is what makes crash testing possible without pulling the power cord.
 - WAL tail classification: damage with no valid record after it is a torn write and recovery stops there cleanly. Damage followed by valid records is corruption: an error with `paranoid_checks`, otherwise point-in-time recovery stops at the damage.
 - MSRV 1.89 (for `File::try_lock`). New dependencies: `crc32fast` (checksums), dev-only `tempfile`.
 
+**Milestone 3 additions** (decided while planning M3):
+- `FileSystem::open_random` returns a `RandomAccessFile` with `read_at(offset, len)` and `size()`. SSTables are read a block at a time, not whole. On unix it uses `pread`.
+- Block entries use varints (LEB128) for lengths: `shared | non_shared | value_len | key delta | value`.
+- The block trailer is only a 4-byte CRC32. There's no compression byte: compression is out of scope for now.
+- The footer is a fixed 48 bytes: index handle, filter handle, format version 1, a CRC over the first 36 bytes, and the magic `strataT1`. The filter handle is reserved (must be zero) until M4 adds bloom filters.
+- The index stores each block's full last key. LevelDB's shorter separator keys are explained but not implemented.
+- No block cache yet. Every block read goes to the file.
+
 ## 6. Testing strategy
 
 Correctness comes first, so these tests run from milestone 1:

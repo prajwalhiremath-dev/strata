@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::{FileLock, FileSystem, WritableFile};
+use super::{FileLock, FileSystem, RandomAccessFile, WritableFile};
 use crate::{Error, Result};
 
 #[derive(Debug, Default)]
@@ -278,6 +278,48 @@ impl WritableFile for SimHandle {
     }
 }
 
+/// Read handle. Reads the file's *live* contents (what a running process
+/// would see, synced or not) and dies with the process on a crash.
+struct SimReader {
+    state: Arc<Mutex<State>>,
+    path: PathBuf,
+    epoch: u64,
+}
+
+impl SimReader {
+    fn with_file<T>(&self, f: impl FnOnce(&SimFile) -> Result<T>) -> Result<T> {
+        let st = self.state.lock();
+        if st.epoch != self.epoch {
+            return Err(sim_err("file handle from before a crash"));
+        }
+        f(st.files
+            .get(&self.path)
+            .ok_or_else(|| not_found(&self.path))?)
+    }
+}
+
+impl RandomAccessFile for SimReader {
+    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.with_file(|file| {
+            let range = usize::try_from(offset)
+                .ok()
+                .and_then(|start| Some(start..start.checked_add(len)?))
+                .filter(|r| r.end <= file.data.len());
+            match range {
+                Some(r) => Ok(file.data[r].to_vec()),
+                None => Err(Error::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read past end of file",
+                ))),
+            }
+        })
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.with_file(|file| Ok(file.data.len() as u64))
+    }
+}
+
 struct SimLock {
     state: Arc<Mutex<State>>,
     path: PathBuf,
@@ -330,6 +372,18 @@ impl FileSystem for SimFs {
             .get(path)
             .map(|f| f.data.clone())
             .unwrap_or_default())
+    }
+
+    fn open_random(&self, path: &Path) -> Result<Box<dyn RandomAccessFile>> {
+        let st = self.state.lock();
+        if !st.is_live(path) {
+            return Err(not_found(path));
+        }
+        Ok(Box::new(SimReader {
+            state: self.state.clone(),
+            path: path.to_path_buf(),
+            epoch: st.epoch,
+        }))
     }
 
     fn list(&self, dir: &Path) -> Result<Vec<String>> {
@@ -389,6 +443,33 @@ mod tests {
         let fs = SimFs::default();
         fs.create_dir_all(dir()).unwrap();
         (fs, dir().join("a.log"))
+    }
+
+    #[test]
+    fn sim_read_at() {
+        let (fs, p) = setup();
+        let mut f = fs.create(&p).unwrap();
+        f.append(b"hello world").unwrap();
+        let r = fs.open_random(&p).unwrap();
+        assert_eq!(r.read_at(6, 5).unwrap(), b"world");
+        assert_eq!(r.read_at(0, 0).unwrap(), b"");
+        assert_eq!(r.size().unwrap(), 11);
+        assert!(r.read_at(8, 5).is_err(), "past the end");
+        assert!(r.read_at(u64::MAX, 1).is_err(), "offset overflow");
+        assert!(fs.open_random(&dir().join("missing")).is_err());
+    }
+
+    #[test]
+    fn sim_read_at_dies_after_crash() {
+        let (fs, p) = setup();
+        let mut f = fs.create(&p).unwrap();
+        fs.sync_dir(dir()).unwrap();
+        f.append(b"abc").unwrap();
+        f.sync().unwrap();
+        let r = fs.open_random(&p).unwrap();
+        fs.crash();
+        assert!(r.read_at(0, 1).is_err());
+        assert!(r.size().is_err());
     }
 
     #[test]
