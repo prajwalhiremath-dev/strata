@@ -16,3 +16,8 @@
 // Used by the table builder and reader (next tasks); tests only until then.
 #[allow(dead_code)]
 pub(crate) mod block;
+mod builder;
+#[allow(dead_code)] // the decoding half is used by the reader (next task)
+pub(crate) mod format;
+
+pub use builder::{TableBuilder, TableMeta, TableOptions};

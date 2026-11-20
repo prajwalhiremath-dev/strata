@@ -14,14 +14,10 @@
 
 use crate::{Error, Result};
 
-// The block format (Task 2) and block handles (Task 3) use these; until then
-// they are only exercised by the tests below.
-#[allow(dead_code)]
 pub(crate) fn put_varint32(dst: &mut Vec<u8>, v: u32) {
     put_varint64(dst, u64::from(v));
 }
 
-#[allow(dead_code)]
 pub(crate) fn put_varint64(dst: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         dst.push((v as u8) | 0x80);
@@ -30,13 +26,12 @@ pub(crate) fn put_varint64(dst: &mut Vec<u8>, mut v: u64) {
     dst.push(v as u8);
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_varint32(src: &[u8]) -> Result<(u32, usize)> {
     let (v, n) = get_varint(src, 32)?;
     Ok((v as u32, n))
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // the table reader (next task) uses it
 pub(crate) fn get_varint64(src: &[u8]) -> Result<(u64, usize)> {
     get_varint(src, 64)
 }
