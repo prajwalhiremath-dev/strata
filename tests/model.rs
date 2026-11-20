@@ -5,9 +5,10 @@
 //! read returns the same answer. When it finds a failing sequence it
 //! *shrinks* it to the smallest sequence that still fails.
 //!
-//! Milestone 2 added Reopen and Crash; later milestones add more (Flush,
-//! Snapshot, ...), so
-//! every new layer is tested against the same simple truth.
+//! Milestone 2 added Reopen and Crash, milestone 4 Flush and a tiny memtable
+//! (so writes flush to tables constantly); later milestones add more
+//! (Snapshot, ...), so every new layer is tested against the same simple
+//! truth.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
@@ -32,6 +33,8 @@ enum Op {
     /// Power loss (drop everything unsynced), then reopen. With
     /// `SyncPolicy::Always` every acknowledged write must survive.
     Crash,
+    /// Write the memtable to an L0 table now.
+    Flush,
 }
 
 /// Tiny key alphabet (1–3 bytes from a..=e) so the same keys are hit often:
@@ -54,6 +57,7 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(Op::Batch),
         1 => Just(Op::Reopen),
         1 => Just(Op::Crash),
+        1 => Just(Op::Flush),
     ]
 }
 
@@ -64,7 +68,8 @@ proptest! {
     fn db_matches_btreemap(ops in proptest::collection::vec(op(), 1..200)) {
         let fs = SimFs::new();
         let open = || {
-            let opts = Options { sync: SyncPolicy::Always, ..Options::default() };
+            // 256 bytes: a flush every dozen or so writes.
+            let opts = Options { sync: SyncPolicy::Always, memtable_size: 256, ..Options::default() };
             Db::open_with_fs("/model", opts, Arc::new(fs.clone())).unwrap()
         };
         let mut db = open();
@@ -80,6 +85,7 @@ proptest! {
                     fs.crash();
                     db = open();
                 }
+                Op::Flush => db.flush().unwrap(),
                 Op::Put(k, v) => {
                     db.put(&k, &v).unwrap();
                     model.insert(k, v);

@@ -15,10 +15,22 @@ use strata::{Db, Error, Options, SyncPolicy, WriteBatch};
 const DIR: &str = "/db";
 
 fn open(fs: &SimFs) -> strata::Result<Db> {
-    Db::open_with_fs(DIR, Options::default(), Arc::new(fs.clone()))
+    open_with(fs, Options::default())
 }
 
-fn all(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn open_with(fs: &SimFs, o: Options) -> strata::Result<Db> {
+    Db::open_with_fs(DIR, o, Arc::new(fs.clone()))
+}
+
+/// Options whose memtable fills after a few dozen small writes.
+fn small(memtable_size: usize) -> Options {
+    Options {
+        memtable_size,
+        ..Options::default()
+    }
+}
+
+fn all(db: &Db) -> Rows {
     db.scan(Unbounded, Unbounded).unwrap()
 }
 
@@ -236,6 +248,33 @@ fn crash_at_every_step_of_open() {
     }
 }
 
+/// Like `crash_at_every_step_of_open`, but the disk may persist unsynced
+/// directory changes in any order.
+#[test]
+fn reordered_crash_at_every_step_of_open() {
+    for n in 0.. {
+        assert!(n < 10_000, "open never finished");
+        let mut finished = false;
+        for seed in 0..8 {
+            let fs = SimFs::new();
+            let db = open(&fs).unwrap();
+            write_known_data(&db);
+            let expected = all(&db);
+            db.close().unwrap();
+            drop(db);
+            fs.kill_after(n);
+            finished = open(&fs).is_ok();
+            fs.crash_reordered(seed);
+            let db = open(&fs).unwrap();
+            assert_eq!(all(&db), expected, "step {n}, seed {seed}");
+            assert!(table_entries(&fs) <= KNOWN_ENTRIES, "step {n}, seed {seed}");
+        }
+        if finished {
+            break;
+        }
+    }
+}
+
 #[test]
 fn table_and_old_log_together_replay_same_state() {
     let fs = SimFs::new();
@@ -276,4 +315,184 @@ fn bad_table_options_are_rejected_at_open() {
         Db::open_with_fs(DIR, o, Arc::new(fs.clone())),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+// ---- Flushing on the write path (Task 5) ----
+
+#[test]
+fn writes_trigger_flushes() {
+    let fs = SimFs::new();
+    let db = open_with(&fs, small(4096)).unwrap();
+    for i in 0..2000 {
+        db.put(&key(i), format!("value{i}").as_bytes()).unwrap();
+    }
+    assert!(files(&fs, ".sst").len() > 1, "{:?}", files(&fs, ".sst"));
+    assert_eq!(files(&fs, ".log").len(), 1, "each flush deletes its log");
+    let check = |db: &Db| {
+        for i in 0..2000 {
+            assert_eq!(
+                db.get(&key(i)).unwrap(),
+                Some(format!("value{i}").into_bytes())
+            );
+        }
+        assert_eq!(all(db).len(), 2000);
+    };
+    check(&db);
+    db.close().unwrap();
+    drop(db);
+    check(&open_with(&fs, small(4096)).unwrap());
+}
+
+#[test]
+fn explicit_flush() {
+    let fs = SimFs::new();
+    let db = open(&fs).unwrap();
+    db.flush().unwrap();
+    assert!(files(&fs, ".sst").is_empty(), "empty memtable: no table");
+    db.put(b"k", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(files(&fs, ".sst").len(), 1);
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    db.flush().unwrap();
+    assert_eq!(files(&fs, ".sst").len(), 1, "nothing new to flush");
+}
+
+#[test]
+fn tombstone_flushed_then_reopen() {
+    let fs = SimFs::new();
+    let db = open(&fs).unwrap();
+    db.put(b"k", b"v").unwrap();
+    db.flush().unwrap();
+    db.delete(b"k").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get(b"k").unwrap(), None);
+    let db = reopen(&fs, db);
+    assert_eq!(db.get(b"k").unwrap(), None);
+    assert!(all(&db).is_empty());
+}
+
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn fifty_keys(fs: &SimFs) -> (Db, Rows) {
+    let db = open(fs).unwrap();
+    for i in 0..50 {
+        db.put(&key(i), format!("v{i}").as_bytes()).unwrap();
+    }
+    let expected = all(&db);
+    (db, expected)
+}
+
+#[test]
+fn crash_at_every_step_of_flush() {
+    for n in 0.. {
+        assert!(n < 10_000, "flush never finished");
+        // Each crash flavour gets the same starting point.
+        let crashes: [&dyn Fn(&SimFs); 5] = [
+            &|fs| fs.crash(),
+            &|fs| fs.crash_reordered(n as u64),
+            &|fs| fs.crash_reordered(n as u64 + 1000),
+            &|fs| fs.crash_reordered(n as u64 + 2000),
+            &|fs| fs.crash_reordered(n as u64 + 3000),
+        ];
+        let mut finished = false;
+        for crash in crashes {
+            let fs = SimFs::new();
+            let (db, expected) = fifty_keys(&fs);
+            fs.kill_after(n);
+            finished = db.flush().is_ok();
+            crash(&fs);
+            drop(db);
+            let db = open(&fs).unwrap();
+            assert_eq!(all(&db), expected, "after dying at step {n} of flush");
+            assert!(
+                table_entries(&fs) <= 50,
+                "step {n}: {} entries on disk",
+                table_entries(&fs)
+            );
+        }
+        if finished {
+            break;
+        }
+    }
+}
+
+#[test]
+fn failed_flush_poisons() {
+    let fs = SimFs::new();
+    let (db, expected) = fifty_keys(&fs);
+    fs.fail_next_sync();
+    assert!(matches!(db.flush(), Err(Error::Io(_))));
+    assert!(matches!(db.put(b"later", b"x"), Err(Error::Poisoned(_))));
+    assert!(matches!(db.flush(), Err(Error::Poisoned(_))));
+    assert_eq!(all(&db), expected, "reads still work");
+    assert_eq!(db.get(&key(7)).unwrap(), Some(b"v7".to_vec()));
+    fs.crash();
+    drop(db);
+    let db = open(&fs).unwrap();
+    assert_eq!(all(&db), expected);
+}
+
+#[test]
+fn write_that_triggers_failed_flush_is_not_applied() {
+    let fs = SimFs::new();
+    let db = open_with(&fs, small(1024)).unwrap();
+    let mut i = 0;
+    // Fill the memtable up to the size that makes the next write flush first.
+    while files(&fs, ".sst").is_empty() {
+        db.put(&key(i), b"0123456789").unwrap();
+        i += 1;
+    }
+    // The write numbered i - 1 found the memtable full (holding i - 1
+    // entries), flushed it, and went into the new one. Refill it to i - 1.
+    for j in i..i + (i - 2) {
+        db.put(&key(j), b"0123456789").unwrap();
+    }
+    assert_eq!(files(&fs, ".sst").len(), 1, "no second flush yet");
+    let expected = all(&db);
+    // The next put must flush first; make that flush fail.
+    fs.fail_next_sync();
+    assert!(db.put(b"trigger", b"x").is_err());
+    assert_eq!(db.get(b"trigger").unwrap(), None);
+    assert_eq!(all(&db), expected);
+    assert_eq!(
+        files(&fs, ".sst").len(),
+        1,
+        "the failed flush published nothing"
+    );
+    fs.crash();
+    drop(db);
+    let db = open(&fs).unwrap();
+    assert_eq!(db.get(b"trigger").unwrap(), None, "never logged");
+    assert_eq!(all(&db), expected);
+}
+
+#[test]
+fn reader_during_flushes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fs = SimFs::new();
+    let db = open_with(&fs, small(4096)).unwrap();
+    for i in 0..100 {
+        db.put(&key(i), b"early").unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut rounds = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                for i in 0..100 {
+                    assert_eq!(db.get(&key(i)).unwrap(), Some(b"early".to_vec()), "key {i}");
+                }
+                rounds += 1;
+            }
+            rounds
+        })
+    };
+    for i in 100..5100 {
+        db.put(&key(i), b"late").unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    let rounds = reader.join().expect("reader saw a missing key");
+    assert!(files(&fs, ".sst").len() > 5, "many flushes happened");
+    assert!(rounds > 0);
 }

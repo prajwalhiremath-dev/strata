@@ -176,6 +176,39 @@ impl SimFs {
         });
     }
 
+    /// Power loss on a disk that persisted directory changes out of order:
+    /// each unsynced creation or removal of a name independently either
+    /// made it to disk or didn't (deterministic per `seed`). File contents
+    /// are lost past their synced length, as in [`crash`](Self::crash).
+    ///
+    /// Without a `sync_dir` in between, nothing orders two directory
+    /// changes: a later removal can survive while an earlier rename is lost.
+    /// (A rename counts as two changes here, so it can even come back as
+    /// both names or neither. Real disks keep a rename atomic, so this is
+    /// stricter than reality, never more lenient.)
+    pub fn crash_reordered(&self, seed: u64) {
+        let mut st = self.state.lock();
+        let mut rng = Rng::new(seed);
+        let dirs: Vec<PathBuf> = st.live.keys().cloned().collect();
+        for dir in dirs {
+            let live = st.live[&dir].clone();
+            let durable = st.durable.entry(dir).or_default();
+            let removed: Vec<String> = durable.difference(&live).cloned().collect();
+            let added: Vec<String> = live.difference(durable).cloned().collect();
+            for name in removed {
+                if rng.next().is_multiple_of(2) {
+                    durable.remove(&name);
+                }
+            }
+            for name in added {
+                if rng.next().is_multiple_of(2) {
+                    durable.insert(name);
+                }
+            }
+        }
+        st.crash_with(|_, f| f.data.truncate(f.synced_len));
+    }
+
     /// Flip every bit of the byte at `offset` (simulates media corruption).
     pub fn corrupt_byte(&self, path: &Path, offset: usize) {
         let mut st = self.state.lock();
@@ -708,6 +741,36 @@ mod tests {
     fn rename_missing_is_err() {
         let (fs, p) = setup();
         assert!(fs.rename(&p, &dir().join("b.sst")).is_err());
+    }
+
+    #[test]
+    fn reordered_crash_keeps_any_subset_of_dir_changes() {
+        let mut outcomes = BTreeSet::new();
+        for seed in 0..64 {
+            let (fs, p) = setup();
+            synced_file(&fs, &p, b"old"); // a.log: durable
+            let q = dir().join("b.sst");
+            synced_file(&fs, &q, b"tbl"); // b.sst: durable
+            fs.remove(&p).unwrap(); // unsynced removal
+            let mut f = fs.create(&dir().join("c.log")).unwrap(); // unsynced creation
+            f.append(b"new").unwrap();
+            f.sync().unwrap();
+            fs.crash_reordered(seed);
+            let names = fs.list(dir()).unwrap();
+            assert!(
+                names.contains(&"b.sst".to_string()),
+                "synced names always survive"
+            );
+            if names.contains(&"a.log".to_string()) {
+                assert_eq!(fs.read(&p).unwrap(), b"old");
+            }
+            if names.contains(&"c.log".to_string()) {
+                assert_eq!(fs.read(&dir().join("c.log")).unwrap(), b"new");
+            }
+            outcomes.insert(names);
+        }
+        // Removal kept or not, creation kept or not: all four combinations.
+        assert_eq!(outcomes.len(), 4, "{outcomes:?}");
     }
 
     #[test]

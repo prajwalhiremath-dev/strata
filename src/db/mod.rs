@@ -16,13 +16,14 @@
 //!
 //! 1. validate the whole batch (nothing is applied if any key/value is bad)
 //! 2. refuse if closed or poisoned
-//! 3. assign consecutive sequence numbers
-//! 4. append the encoded batch to the WAL, and sync per [`SyncPolicy`]
-//! 5. insert every entry into the memtable
-//! 6. **publish** by storing the last seqno into `visible_seqno`
+//! 3. if the memtable is full, flush it first ([`flush`])
+//! 4. assign consecutive sequence numbers
+//! 5. append the encoded batch to the WAL, and sync per [`SyncPolicy`]
+//! 6. insert every entry into the memtable
+//! 7. **publish** by storing the last seqno into `visible_seqno`
 //!
 //! The log comes first so that anything a reader could ever see is already in
-//! the log. If step 4 fails the database is *poisoned*: the log may now end in
+//! the log. If step 5 fails the database is *poisoned*: the log may now end in
 //! a partial record, and a later write appended after it would be lost on
 //! recovery, so further writes are refused (chapter 02).
 //!
@@ -74,9 +75,7 @@ pub(crate) struct ReadState {
 
 struct DbInner {
     options: Options,
-    #[allow(dead_code)] // the write-path flush uses these from Task 5
     fs: Arc<dyn FileSystem>,
-    #[allow(dead_code)]
     dir: PathBuf,
     /// Replaced (never mutated) under the writer lock.
     state: RwLock<Arc<ReadState>>,
@@ -93,10 +92,8 @@ struct Writer {
     last_seqno: SeqNo,
     wal: WalWriter,
     /// The current log's file number (deleted after the next flush).
-    #[allow(dead_code)] // the write-path flush uses these from Task 5
     log_number: u64,
     /// Next unused file number, shared by logs and tables.
-    #[allow(dead_code)]
     next_file_number: u64,
     writes_since_sync: u32,
     /// Set after a failed log append/sync; further writes are refused.
@@ -184,6 +181,12 @@ impl Db {
         }
         if batch.is_empty() {
             return Ok(());
+        }
+        // Flush *before* logging: if the flush fails, this batch was never
+        // logged or applied, and the caller gets the error.
+        let mem_size = self.inner.state.read().mem.approximate_size();
+        if mem_size > 0 && mem_size >= self.inner.options.memtable_size {
+            flush::flush_locked(&self.inner, &mut w)?;
         }
         let count = batch.len() as u64;
         if w.last_seqno + count > MAX_SEQNO {
@@ -289,6 +292,21 @@ impl Db {
         let snapshot = self.inner.visible_seqno.load(Ordering::Acquire);
         let state = self.inner.state.read().clone();
         (snapshot, state)
+    }
+
+    /// Write the memtable to an L0 table now, and delete its log. Does
+    /// nothing if the memtable is empty. A failure poisons the database, as a
+    /// failed log write does.
+    pub fn flush(&self) -> Result<()> {
+        let mut w = self.inner.writer.lock();
+        self.check_open()?;
+        if let Some(reason) = &w.poisoned {
+            return Err(Error::Poisoned(reason.clone()));
+        }
+        if self.inner.state.read().mem.is_empty() {
+            return Ok(());
+        }
+        flush::flush_locked(&self.inner, &mut w)
     }
 
     /// Sync the log, release the directory lock and close. Further operations
